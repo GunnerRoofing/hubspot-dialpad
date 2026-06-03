@@ -59,14 +59,36 @@ async function lookupContact(client, dialpadContactId, fallbackPhone) {
 }
 
 async function getContactDeals(client, contactId) {
-  const response = await fetch(
+  // Get deal IDs directly associated to this contact
+  const assocResp = await fetch(
     `https://api.hubapi.com/crm/v4/objects/contacts/${contactId}/associations/deals`,
     { headers: { 'Authorization': `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN}`, 'Accept-Encoding': 'identity' } }
   );
-  const data = await response.json();
-  const results = data.results || [];
-  console.log('DEALS v4:', results.length, results.map(r => r.toObjectId));
-  return results.map(r => r.toObjectId);
+  const assocData = await assocResp.json();
+  const dealIds = (assocData.results || []).map(r => r.toObjectId);
+
+  if (!dealIds.length) {
+    console.log('MOST RECENT DEAL: none');
+    return [];
+  }
+
+  if (dealIds.length === 1) {
+    console.log('MOST RECENT DEAL:', dealIds[0]);
+    return dealIds;
+  }
+
+  // Multiple deals — fetch createdate and pick the newest
+  const dealsResp = await client.crm.deals.batchApi.read({
+    inputs: dealIds.map(id => ({ id: String(id) })),
+    properties: ['dealname', 'createdate'],
+  });
+
+  const sorted = (dealsResp.results || [])
+    .sort((a, b) => new Date(b.properties.createdate) - new Date(a.properties.createdate));
+
+  const top = sorted[0];
+  console.log('MOST RECENT DEAL:', top.id, `(${top.properties.dealname})`);
+  return [top.id];
 }
 
 async function handleSmsEvent(client, body) {
