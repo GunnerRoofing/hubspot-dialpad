@@ -159,7 +159,10 @@ async function handleCallEvent(client, body) {
   const externalPhone = body.external_number;
   const contact = await lookupContact(client, body.contact?.id, externalPhone);
 
-  const durationSec = body.duration || 0;
+  console.log('CALL PAYLOAD:', JSON.stringify(body));
+  const talkTimeMs = body.talk_time || 0;
+  console.log('RAW TALK TIME (ms):', talkTimeMs);
+  const durationSec = Math.round(talkTimeMs / 1000);
   const mins = Math.floor(durationSec / 60);
   const secs = durationSec % 60;
 
@@ -170,7 +173,7 @@ async function handleCallEvent(client, body) {
   const call = await client.crm.objects.basicApi.create('calls', {
     properties: {
       hs_call_body: callBody,
-      hs_call_duration: String(durationSec * 1000),
+      hs_call_duration: String(talkTimeMs),
       hs_call_direction: body.direction === 'inbound' ? 'INBOUND' : 'OUTBOUND',
       hs_call_status: 'COMPLETED',
       hs_call_recording_url: body.recording_url || '',
