@@ -1,0 +1,26 @@
+{
+  "config": {
+    "auth": {
+      "type": "static",
+      "optionalScopes": [],
+      "requiredScopes": [
+        "crm.objects.contacts.read",
+        "crm.objects.deals.read",
+        "crm.objects.calls.read",
+        "crm.objects.calls.write"
+      ],
+      "conditionallyRequiredScopes": []
+    },
+    "name": "Dialpad SMS",
+    "description": "",
+    "isUserLevel": false,
+    "distribution": "PRIVATE",
+    "permittedUrls": {
+      "img": [],
+      "fetch": [],
+      "iframe": []
+    }
+  },
+  "uid": "DialpadSMS",
+  "type": "app"
+}

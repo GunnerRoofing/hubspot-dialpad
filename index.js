@@ -1,6 +1,7 @@
 const hubspot = require('@hubspot/api-client');
 
 exports.handler = async (event) => {
+  console.log('PARSED BODY:', event.body);
   const body = JSON.parse(event.body || '{}');
 
   const client = new hubspot.Client({
@@ -9,7 +10,7 @@ exports.handler = async (event) => {
 
   try {
     const isCall = body.call_id !== undefined || body.external_number !== undefined;
-    const isSms = body.text !== undefined || body.from_number !== undefined;
+    const isSms = body.text !== undefined && body.text !== null && body.from_number !== undefined;
 
     if (isCall) {
       if (body.state !== 'hangup' && body.event !== 'hangup') {
@@ -24,96 +25,93 @@ exports.handler = async (event) => {
 
     return respond(200, { status: 'ok' });
   } catch (err) {
-    console.error('Dialpad webhook error:', err.message);
-    // Always 200 so Dialpad does not retry
+    console.error('Webhook error:', err.message, err.body || '');
     return respond(200, { status: 'error', message: err.message });
   }
 };
 
 async function lookupContact(client, dialpadContactId, fallbackPhone) {
   if (dialpadContactId) {
-    const resp = await client.apiRequest({
-      method: 'POST',
-      path: '/crm/v3/objects/contacts/search',
-      body: {
-        filterGroups: [{
-          filters: [{ propertyName: 'dialpad_id', operator: 'EQ', value: String(dialpadContactId) }],
-        }],
-        properties: ['firstname', 'lastname', 'phone'],
-        limit: 1,
-      },
+    const resp = await client.crm.contacts.searchApi.doSearch({
+      filterGroups: [{ filters: [{ propertyName: 'dialpad_id', operator: 'EQ', value: String(dialpadContactId) }] }],
+      properties: ['firstname', 'lastname', 'phone'],
+      limit: 1,
     });
-    const found = resp.body?.results?.[0];
+    const found = resp.results?.[0];
+    console.log('DIALPAD_ID LOOKUP:', dialpadContactId, '->', found ? `found ${found.id}` : 'not found');
     if (found) return found;
   }
 
   if (fallbackPhone) {
-    const resp = await client.apiRequest({
-      method: 'POST',
-      path: '/crm/v3/objects/contacts/search',
-      body: {
-        filterGroups: [
-          { filters: [{ propertyName: 'phone', operator: 'EQ', value: fallbackPhone }] },
-          { filters: [{ propertyName: 'mobilephone', operator: 'EQ', value: fallbackPhone }] },
-        ],
-        properties: ['firstname', 'lastname', 'phone'],
-        limit: 1,
-      },
+    const resp = await client.crm.contacts.searchApi.doSearch({
+      filterGroups: [
+        { filters: [{ propertyName: 'phone', operator: 'EQ', value: fallbackPhone }] },
+        { filters: [{ propertyName: 'mobilephone', operator: 'EQ', value: fallbackPhone }] },
+      ],
+      properties: ['firstname', 'lastname', 'phone'],
+      limit: 1,
     });
-    return resp.body?.results?.[0] || null;
+    const found = resp.results?.[0];
+    console.log('PHONE LOOKUP:', fallbackPhone, '->', found ? `found ${found.id}` : 'not found');
+    return found || null;
   }
 
   return null;
 }
 
 async function getContactDeals(client, contactId) {
-  const resp = await client.apiRequest({
-    method: 'GET',
-    path: `/crm/v3/objects/contacts/${contactId}/associations/deals`,
+  const resp = await client.crm.deals.searchApi.doSearch({
+    filterGroups: [{ filters: [{ propertyName: 'associations.contact', operator: 'EQ', value: String(contactId) }] }],
+    properties: ['dealname'],
+    limit: 50,
   });
-  return (resp.body?.results || []).map(r => r.id);
+  const deals = resp.results || [];
+  console.log('DEALS FOUND:', deals.length, deals.map(d => d.id));
+  return deals.map(d => d.id);
 }
 
 async function handleSmsEvent(client, body) {
-  const externalPhone = body.direction === 'inbound' ? body.from_number : body.to_number;
-  const dialpadContactId = body.contact?.id;
-  const contact = await lookupContact(client, dialpadContactId, externalPhone);
+  const toNumber = Array.isArray(body.to_number) ? body.to_number[0] : body.to_number;
+  const externalPhone = body.direction === 'inbound' ? body.from_number : toNumber;
+  const contact = await lookupContact(client, body.contact?.id, externalPhone);
 
-  const commResp = await client.apiRequest({
-    method: 'POST',
-    path: '/crm/v3/objects/communications',
-    body: {
-      properties: {
-        hs_communication_channel: 'SMS',
-        hs_communication_body: body.text || '',
-        hs_timestamp: body.date_created ? String(body.date_created) : String(Date.now()),
-      },
+  const comm = await client.crm.objects.basicApi.create('communications', {
+    properties: {
+      hs_communication_channel_type: 'SMS',
+      hs_communication_logged_from: 'CRM',
+      hs_communication_body: body.text || '',
+      hs_timestamp: body.created_date ? String(body.created_date) : String(Date.now()),
     },
   });
 
-  const commId = commResp.body?.id;
-  if (!commId || !contact) return;
+  console.log('COMMUNICATION CREATED:', comm.id);
 
-  await client.apiRequest({
-    method: 'PUT',
-    path: `/crm/v3/objects/communications/${commId}/associations/contact/${contact.id}/communication_to_contact`,
-  });
+  if (!comm.id || !contact) {
+    console.log('STOPPING — commId:', comm.id, 'contact:', contact?.id || 'null');
+    return;
+  }
+
+  await client.crm.associations.v4.basicApi.create(
+    'communications', comm.id, 'contacts', contact.id,
+    [{ associationTypeId: 81, associationCategory: 'HUBSPOT_DEFINED' }]
+  );
+  console.log('ASSOCIATED to contact', contact.id);
 
   const dealIds = await getContactDeals(client, contact.id);
+  console.log('DEALS FOUND:', dealIds.length);
   await Promise.all(
     dealIds.map(dealId =>
-      client.apiRequest({
-        method: 'PUT',
-        path: `/crm/v3/objects/communications/${commId}/associations/deal/${dealId}/communication_to_deal`,
-      })
+      client.crm.associations.v4.basicApi.create(
+        'communications', comm.id, 'deals', dealId,
+        [{ associationTypeId: 87, associationCategory: 'HUBSPOT_DEFINED' }]
+      ).catch(err => console.warn('SKIP deal', dealId, err.message))
     )
   );
 }
 
 async function handleCallEvent(client, body) {
   const externalPhone = body.external_number;
-  const dialpadContactId = body.contact?.id;
-  const contact = await lookupContact(client, dialpadContactId, externalPhone);
+  const contact = await lookupContact(client, body.contact?.id, externalPhone);
 
   const durationSec = body.duration || 0;
   const mins = Math.floor(durationSec / 60);
@@ -123,38 +121,38 @@ async function handleCallEvent(client, body) {
   if (body.recording_url) callBody += `\nRecording: ${body.recording_url}`;
   if (body.voicemail_url) callBody += `\nVoicemail: ${body.voicemail_url}`;
 
-  const callResp = await client.apiRequest({
-    method: 'POST',
-    path: '/crm/v3/objects/calls',
-    body: {
-      properties: {
-        hs_call_body: callBody,
-        hs_call_duration: String(durationSec * 1000),
-        hs_call_direction: body.direction === 'inbound' ? 'INBOUND' : 'OUTBOUND',
-        hs_call_status: 'COMPLETED',
-        hs_call_recording_url: body.recording_url || '',
-        hs_call_from_number: body.internal_number || '',
-        hs_call_to_number: body.external_number || '',
-        hs_timestamp: body.date_started ? String(body.date_started) : String(Date.now()),
-      },
+  const call = await client.crm.objects.basicApi.create('calls', {
+    properties: {
+      hs_call_body: callBody,
+      hs_call_duration: String(durationSec * 1000),
+      hs_call_direction: body.direction === 'inbound' ? 'INBOUND' : 'OUTBOUND',
+      hs_call_status: 'COMPLETED',
+      hs_call_recording_url: body.recording_url || '',
+      hs_call_from_number: body.internal_number || '',
+      hs_call_to_number: body.external_number || '',
+      hs_timestamp: body.date_started ? String(body.date_started) : String(Date.now()),
     },
   });
 
-  const callId = callResp.body?.id;
-  if (!callId || !contact) return;
+  console.log('CALL CREATED:', call.id);
 
-  await client.apiRequest({
-    method: 'PUT',
-    path: `/crm/v3/objects/calls/${callId}/associations/contact/${contact.id}/call_to_contact`,
-  });
+  if (!call.id || !contact) {
+    console.log('STOPPING — callId:', call.id, 'contact:', contact?.id || 'null');
+    return;
+  }
+
+  await client.crm.objects.associationsApi.create(
+    'calls', call.id, 'contacts', contact.id,
+    [{ associationTypeId: 194, associationCategory: 'HUBSPOT_DEFINED' }]
+  );
 
   const dealIds = await getContactDeals(client, contact.id);
   await Promise.all(
     dealIds.map(dealId =>
-      client.apiRequest({
-        method: 'PUT',
-        path: `/crm/v3/objects/calls/${callId}/associations/deal/${dealId}/call_to_deal`,
-      })
+      client.crm.associations.v4.basicApi.create(
+        'calls', call.id, 'deals', dealId,
+        [{ associationTypeId: 206, associationCategory: 'HUBSPOT_DEFINED' }]
+      )
     )
   );
 }
