@@ -1,7 +1,6 @@
 const hubspot = require('@hubspot/api-client');
 
 exports.handler = async (event) => {
-  console.log('PARSED BODY:', event.body);
   const body = JSON.parse(event.body || '{}');
 
   const client = new hubspot.Client({
@@ -60,14 +59,14 @@ async function lookupContact(client, dialpadContactId, fallbackPhone) {
 }
 
 async function getContactDeals(client, contactId) {
-  const resp = await client.crm.deals.searchApi.doSearch({
-    filterGroups: [{ filters: [{ propertyName: 'associations.contact', operator: 'EQ', value: String(contactId) }] }],
-    properties: ['dealname'],
-    limit: 50,
-  });
-  const deals = resp.results || [];
-  console.log('DEALS FOUND:', deals.length, deals.map(d => d.id));
-  return deals.map(d => d.id);
+  const response = await fetch(
+    `https://api.hubapi.com/crm/v4/objects/contacts/${contactId}/associations/deals`,
+    { headers: { 'Authorization': `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN}`, 'Accept-Encoding': 'identity' } }
+  );
+  const data = await response.json();
+  const results = data.results || [];
+  console.log('DEALS v4:', results.length, results.map(r => r.toObjectId));
+  return results.map(r => r.toObjectId);
 }
 
 async function handleSmsEvent(client, body) {
@@ -103,7 +102,7 @@ async function handleSmsEvent(client, body) {
     dealIds.map(dealId =>
       client.crm.associations.v4.basicApi.create(
         'communications', comm.id, 'deals', dealId,
-        [{ associationTypeId: 87, associationCategory: 'HUBSPOT_DEFINED' }]
+        [{ associationTypeId: 85, associationCategory: 'HUBSPOT_DEFINED' }]
       ).catch(err => console.warn('SKIP deal', dealId, err.message))
     )
   );
@@ -141,7 +140,7 @@ async function handleCallEvent(client, body) {
     return;
   }
 
-  await client.crm.objects.associationsApi.create(
+  await client.crm.associations.v4.basicApi.create(
     'calls', call.id, 'contacts', contact.id,
     [{ associationTypeId: 194, associationCategory: 'HUBSPOT_DEFINED' }]
   );
