@@ -92,6 +92,18 @@ async function getContactDeals(client, contactId) {
 }
 
 async function handleSmsEvent(client, body) {
+  // Dedup check
+  const dialpadEventId = String(body.id);
+  const existing = await client.crm.objects.searchApi.doSearch('communications', {
+    filterGroups: [{ filters: [{ propertyName: 'hs_engagement_source_id', operator: 'EQ', value: dialpadEventId }] }],
+    properties: ['hs_engagement_source_id'],
+    limit: 1,
+  });
+  if (existing.results?.length) {
+    console.log('SKIP duplicate SMS', dialpadEventId);
+    return;
+  }
+
   const toNumber = Array.isArray(body.to_number) ? body.to_number[0] : body.to_number;
   const externalPhone = body.direction === 'inbound' ? body.from_number : toNumber;
   const contact = await lookupContact(client, body.contact?.id, externalPhone);
@@ -102,6 +114,7 @@ async function handleSmsEvent(client, body) {
       hs_communication_logged_from: 'CRM',
       hs_communication_body: body.text || '',
       hs_timestamp: body.created_date ? String(body.created_date) : String(Date.now()),
+      hs_engagement_source_id: dialpadEventId,
     },
   });
 
@@ -131,6 +144,18 @@ async function handleSmsEvent(client, body) {
 }
 
 async function handleCallEvent(client, body) {
+  // Dedup check
+  const dialpadCallId = String(body.call_id || body.id);
+  const existing = await client.crm.objects.searchApi.doSearch('calls', {
+    filterGroups: [{ filters: [{ propertyName: 'hs_call_external_id', operator: 'EQ', value: dialpadCallId }] }],
+    properties: ['hs_call_external_id'],
+    limit: 1,
+  });
+  if (existing.results?.length) {
+    console.log('SKIP duplicate call', dialpadCallId);
+    return;
+  }
+
   const externalPhone = body.external_number;
   const contact = await lookupContact(client, body.contact?.id, externalPhone);
 
@@ -152,6 +177,7 @@ async function handleCallEvent(client, body) {
       hs_call_from_number: body.internal_number || '',
       hs_call_to_number: body.external_number || '',
       hs_timestamp: body.date_started ? String(body.date_started) : String(Date.now()),
+      hs_call_external_id: dialpadCallId,
     },
   });
 
