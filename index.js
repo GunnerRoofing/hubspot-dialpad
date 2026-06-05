@@ -92,55 +92,70 @@ async function getContactDeals(client, contactId) {
 }
 
 async function handleSmsEvent(client, body) {
-  // Dedup check
-  const dialpadEventId = String(body.id);
-  const existing = await client.crm.objects.searchApi.doSearch('communications', {
-    filterGroups: [{ filters: [{ propertyName: 'hs_engagement_source_id', operator: 'EQ', value: dialpadEventId }] }],
-    properties: ['hs_engagement_source_id'],
-    limit: 1,
-  });
-  if (existing.results?.length) {
-    console.log('SKIP duplicate SMS', dialpadEventId);
-    return;
-  }
-
+  // Native Dialpad "Log SMS as activities" already creates the SMS communication and
+  // links it to the contact (as one daily-rollup record). We DO NOT create anything —
+  // we only add the contact's-deal association that native omits.
   const toNumber = Array.isArray(body.to_number) ? body.to_number[0] : body.to_number;
   const externalPhone = body.direction === 'inbound' ? body.from_number : toNumber;
   const contact = await lookupContact(client, body.contact?.id, externalPhone);
-
-  const comm = await client.crm.objects.basicApi.create('communications', {
-    properties: {
-      hs_communication_channel_type: 'SMS',
-      hs_communication_logged_from: 'CRM',
-      hs_communication_body: body.text || '',
-      hs_timestamp: body.created_date ? String(body.created_date) : String(Date.now()),
-      hs_engagement_source_id: dialpadEventId,
-    },
-  });
-
-  console.log('COMMUNICATION CREATED:', comm.id);
-
-  if (!comm.id || !contact) {
-    console.log('STOPPING — commId:', comm.id, 'contact:', contact?.id || 'null');
+  if (!contact) {
+    console.log('SMS: no contact for', body.contact?.id || 'n/a', externalPhone || 'n/a');
     return;
   }
 
-  await client.crm.associations.v4.basicApi.create(
-    'communications', comm.id, 'contacts', contact.id,
-    [{ associationTypeId: 81, associationCategory: 'HUBSPOT_DEFINED' }]
-  );
-  console.log('ASSOCIATED to contact', contact.id);
-
   const dealIds = await getContactDeals(client, contact.id);
-  console.log('DEALS FOUND:', dealIds.length);
-  await Promise.all(
-    dealIds.map(dealId =>
-      client.crm.associations.v4.basicApi.create(
-        'communications', comm.id, 'deals', dealId,
+  if (!dealIds.length) {
+    console.log('SMS: no deal for contact', contact.id);
+    return;
+  }
+
+  // Native and this webhook fire on the same SMS, so the communication may not exist
+  // the instant we look — retry briefly (within the Lambda timeout).
+  let commId = null;
+  for (let i = 0; i < 4; i++) {
+    commId = await latestSmsComm(client, contact.id);
+    if (commId) break;
+    console.log(`SMS: native comm not found yet (attempt ${i + 1}) — waiting`);
+    await sleep(2500);
+  }
+  if (!commId) {
+    console.log('SMS: no native SMS comm found for contact', contact.id);
+    return;
+  }
+
+  for (const dealId of dealIds) {
+    try {
+      await client.crm.associations.v4.basicApi.create(
+        'communications', commId, 'deals', dealId,
         [{ associationTypeId: 85, associationCategory: 'HUBSPOT_DEFINED' }]
-      ).catch(err => console.warn('SKIP deal', dealId, err.message))
-    )
+      );
+      console.log('SMS: associated comm', commId, '-> deal', dealId);
+    } catch (err) {
+      console.warn('SMS: skip deal', dealId, err.message);
+    }
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Most-recent SMS communication on the contact (the active daily-rollup record native logs).
+async function latestSmsComm(client, contactId) {
+  const assocResp = await fetch(
+    `https://api.hubapi.com/crm/v4/objects/contacts/${contactId}/associations/communications`,
+    { headers: { 'Authorization': `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN}`, 'Accept-Encoding': 'identity' } }
   );
+  const assocData = await assocResp.json();
+  const ids = (assocData.results || []).map((r) => String(r.toObjectId));
+  if (!ids.length) return null;
+
+  const batch = await client.crm.objects.batchApi.read('communications', {
+    inputs: ids.map((id) => ({ id })),
+    properties: ['hs_communication_channel_type', 'hs_lastmodifieddate'],
+  });
+  const sms = (batch.results || [])
+    .filter((c) => c.properties.hs_communication_channel_type === 'SMS')
+    .sort((a, b) => new Date(b.properties.hs_lastmodifieddate) - new Date(a.properties.hs_lastmodifieddate));
+  return sms[0]?.id || null;
 }
 
 async function handleCallEvent(client, body) {
