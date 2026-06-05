@@ -144,8 +144,9 @@ async function handleSmsEvent(client, body) {
 }
 
 async function handleCallEvent(client, body) {
-  // Dedup check
-  const dialpadCallId = String(body.call_id || body.id);
+  // Use master_call_id for callcenter calls (shared across all simultaneous ring legs)
+  // Fall back to call_id for direct calls (no master_call_id present)
+  const dialpadCallId = String(body.master_call_id || body.call_id || body.id);
   const existing = await client.crm.objects.searchApi.doSearch('calls', {
     filterGroups: [{ filters: [{ propertyName: 'hs_call_external_id', operator: 'EQ', value: dialpadCallId }] }],
     properties: ['hs_call_external_id'],
