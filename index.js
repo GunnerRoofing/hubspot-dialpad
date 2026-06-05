@@ -1,25 +1,34 @@
 const hubspot = require('@hubspot/api-client');
 
 exports.handler = async (event) => {
-  const body = JSON.parse(event.body || '{}');
+  let body = {};
+  try {
+    body = JSON.parse(event.body || '{}');
+  } catch (e) {
+    console.log('PARSE FAIL | isB64:', event.isBase64Encoded, '| raw80:', String(event.body).slice(0, 80));
+    return respond(200, { status: 'skipped', reason: 'unparseable body' });
+  }
 
   const client = new hubspot.Client({
     accessToken: process.env.HUBSPOT_ACCESS_TOKEN,
   });
 
-  try {
-    const isCall = body.call_id !== undefined || body.external_number !== undefined;
-    const isSms = body.text !== undefined && body.text !== null && body.from_number !== undefined;
+  // Call events carry call_id/external_number. This webhook only receives call-hangups
+  // and SMS, so anything that isn't a call is treated as an SMS (catches MMS/group/office
+  // variants that the old strict text+from_number check silently dropped).
+  const isCall = body.call_id !== undefined || body.external_number !== undefined;
+  console.log('EVT |', isCall ? 'CALL' : 'SMS',
+              '| state:', body.state, '| dir:', body.direction,
+              '| msgStatus:', body.message_status, '| hasText:', body.text !== undefined);
 
+  try {
     if (isCall) {
       if (body.state !== 'hangup' && body.event !== 'hangup') {
         return respond(200, { status: 'skipped', reason: 'call not completed' });
       }
       await handleCallEvent(client, body);
-    } else if (isSms) {
-      await handleSmsEvent(client, body);
     } else {
-      return respond(200, { status: 'skipped', reason: 'unknown event type' });
+      await handleSmsEvent(client, body);
     }
 
     return respond(200, { status: 'ok' });
@@ -101,71 +110,124 @@ async function getContactDeals(client, contactId) {
   return [top.id];
 }
 
+// YYYYMMDD in America/New_York (so "same day" matches the team's local day, like native).
+function easternDayKey(ms) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date(ms)).replace(/-/g, '');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// One message line, native-style: <strong>Name</strong> <em>[ts ET]</em>: text
+// (No hidden marker — HubSpot strips HTML comments. Dedup matches the whole line, which
+// embeds the per-message timestamp + text, so a re-sent message yields an identical line.)
+function buildSmsLine(body, text, tsMs) {
+  const name = body.direction === 'inbound'
+    ? (body.contact?.name || body.from_number || 'Customer')
+    : (body.target?.name || 'Agent');
+  const ts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(new Date(tsMs));
+  return `<strong>${escapeHtml(name)}</strong> <em>[${ts} ET]</em>: ${escapeHtml(text)}`;
+}
+
 async function handleSmsEvent(client, body) {
-  // Native Dialpad "Log SMS as activities" already creates the SMS communication and
-  // links it to the contact (as one daily-rollup record). We DO NOT create anything —
-  // we only add the contact's-deal association that native omits.
-  const toNumber = Array.isArray(body.to_number) ? body.to_number[0] : body.to_number;
-  const externalPhone = body.direction === 'inbound' ? body.from_number : toNumber;
-  const contact = await lookupContact(client, body.contact?.id, externalPhone);
-  if (!contact) {
-    console.log('SMS: no contact for', body.contact?.id || 'n/a', externalPhone || 'n/a');
+  // This webhook delivers TWO events per message: the message itself (carries
+  // text/text_content/mms_url) AND a delivery-status callback (message_status only, no body).
+  // Only log real messages — status callbacks have no body.
+  const hasBody = body.text !== undefined || body.text_content !== undefined || body.mms_url !== undefined;
+  if (!hasBody) {
+    console.log('SMS: delivery/status callback — skip |', body.message_status || body.message_delivery_result || '');
     return;
   }
+  if (body.is_internal) {
+    console.log('SMS: internal message — skip');
+    return;
+  }
+
+  const messageBody = body.text || body.text_content || body.mms_url || '';
+  const msgId = body.id !== undefined && body.id !== null ? String(body.id) : null;
+  const toNumber = Array.isArray(body.to_number) ? body.to_number[0] : body.to_number;
+  const externalPhone = body.direction === 'inbound' ? body.from_number : toNumber;
+  if (!externalPhone) {
+    console.log('SMS: no customer phone resolvable — skip. dir:', body.direction);
+    return;
+  }
+
+  const contact = await lookupContact(client, body.contact?.id, externalPhone);
+  if (!contact) {
+    // Native still creates contacts during this phase; revisit when native is off.
+    console.log('SMS: no contact for', externalPhone, '— skip');
+    return;
+  }
+
+  // Daily-thread rollup (mimics native): one SMS comm per contact per Eastern day, appended.
+  // Keyed deterministically by hs_engagement_source_id so we can find today's thread.
+  const tsMs = Number(body.created_date) || Date.now();
+  const threadKey = `dpthread-${contact.id}-${easternDayKey(tsMs)}`;
+  const line = buildSmsLine(body, messageBody, tsMs);
+
+  const existing = await client.crm.objects.searchApi.doSearch('communications', {
+    filterGroups: [{ filters: [{ propertyName: 'hs_engagement_source_id', operator: 'EQ', value: threadKey }] }],
+    properties: ['hs_communication_body', 'hs_engagement_source_id'],
+    limit: 1,
+  });
+  const thread = existing.results?.[0];
+
+  if (thread) {
+    const curBody = thread.properties.hs_communication_body || '';
+    // Dedup within the thread (Dialpad may resend the body event): the line embeds the
+    // per-message timestamp + text, so an identical line means the same message re-sent.
+    if (curBody.includes(line)) {
+      console.log('SMS: message already in thread', msgId, '— skip');
+      return;
+    }
+    await client.crm.objects.basicApi.update('communications', thread.id, {
+      properties: { hs_communication_body: curBody + '<br>' + line, hs_timestamp: String(tsMs) },
+    });
+    console.log('SMS: appended to thread', thread.id, '| contact', contact.id, '| msg', msgId);
+    return;
+  }
+
+  // First message of the day for this contact → create the thread + associate once.
+  // (Rare race: two messages within HubSpot's search-index lag can split into two threads.)
+  const comm = await client.crm.objects.basicApi.create('communications', {
+    properties: {
+      hs_communication_channel_type: 'SMS',
+      hs_communication_logged_from: 'CRM',
+      hs_communication_body: line,
+      hs_timestamp: String(tsMs),
+      hs_engagement_source_id: threadKey,
+    },
+  });
+  console.log('SMS: created thread', comm.id, '| contact', contact.id, '| key', threadKey);
+
+  await client.crm.associations.v4.basicApi.create(
+    'communications', comm.id, 'contacts', contact.id,
+    [{ associationTypeId: 81, associationCategory: 'HUBSPOT_DEFINED' }]
+  );
+  console.log('SMS: associated thread', comm.id, '-> contact', contact.id);
 
   const dealIds = await getContactDeals(client, contact.id);
   if (!dealIds.length) {
-    console.log('SMS: no deal for contact', contact.id);
+    console.log('SMS: no deal for contact', contact.id, '— thread on contact only');
     return;
   }
-
-  // Native and this webhook fire on the same SMS, so the communication may not exist
-  // the instant we look — retry briefly (within the Lambda timeout).
-  let commId = null;
-  for (let i = 0; i < 4; i++) {
-    commId = await latestSmsComm(client, contact.id);
-    if (commId) break;
-    console.log(`SMS: native comm not found yet (attempt ${i + 1}) — waiting`);
-    await sleep(2500);
-  }
-  if (!commId) {
-    console.log('SMS: no native SMS comm found for contact', contact.id);
-    return;
-  }
-
   for (const dealId of dealIds) {
     try {
       await client.crm.associations.v4.basicApi.create(
-        'communications', commId, 'deals', dealId,
+        'communications', comm.id, 'deals', dealId,
         [{ associationTypeId: 85, associationCategory: 'HUBSPOT_DEFINED' }]
       );
-      console.log('SMS: associated comm', commId, '-> deal', dealId);
+      console.log('SMS: associated thread', comm.id, '-> deal', dealId);
     } catch (err) {
       console.warn('SMS: skip deal', dealId, err.message);
     }
   }
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// Most-recent SMS communication on the contact (the active daily-rollup record native logs).
-async function latestSmsComm(client, contactId) {
-  const assocResp = await fetch(
-    `https://api.hubapi.com/crm/v4/objects/contacts/${contactId}/associations/communications`,
-    { headers: { 'Authorization': `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN}`, 'Accept-Encoding': 'identity' } }
-  );
-  const assocData = await assocResp.json();
-  const ids = (assocData.results || []).map((r) => String(r.toObjectId));
-  if (!ids.length) return null;
-
-  const batch = await client.crm.objects.batchApi.read('communications', {
-    inputs: ids.map((id) => ({ id })),
-    properties: ['hs_communication_channel_type', 'hs_lastmodifieddate'],
-  });
-  const sms = (batch.results || [])
-    .filter((c) => c.properties.hs_communication_channel_type === 'SMS')
-    .sort((a, b) => new Date(b.properties.hs_lastmodifieddate) - new Date(a.properties.hs_lastmodifieddate));
-  return sms[0]?.id || null;
 }
 
 async function handleCallEvent(client, body) {
