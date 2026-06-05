@@ -42,11 +42,15 @@ Lambda
 - **Talk time:** Uses `body.talk_time` (milliseconds), NOT `body.duration`. Duration was unreliable.
 - **Webhook format:** Dialpad sends plain JSON (not JWT). No base64 decoding needed here.
 
-## Known Issue — Simultaneous Ring Duplicates
+## Callcenter Call Handling
 
-When a call comes through a callcenter with simultaneous ring, each agent's ring leg fires a separate `hangup` event with its own unique `call_id`. The dedup check uses `call_id` so all legs get logged as separate call records.
+Callcenter calls create two types of `hangup` events:
+1. **Entry point leg** — `target.type` is `coaching_team` or `callcenter`. No agent info. **Skipped entirely.**
+2. **Operator leg** — `target.type` is `user`. Has agent email. **Logged.** Dedup key is `entry_point_call_id` (shared across all simultaneous ring legs of the same call).
 
-**Fix needed:** Use `master_call_id` or `entry_point_call_id` as the dedup key for callcenter calls. The master_call_id is shared across all legs of the same logical call.
+**Note:** `master_call_id` is always `null` in Dialpad payloads — do not use it.
+
+**TODO (pending VP decision):** Unanswered callcenter calls (entry point fires `hangup`, no operator leg exists) are currently not logged. Decide whether to log these as 0-duration calls against the contact.
 
 ## Infrastructure
 
@@ -95,7 +99,7 @@ For any change beyond a single trivial edit:
 ## Known Gotchas
 
 - **`talk_time` not `duration`:** Dialpad's `duration` field was unreliable. `talk_time` is in milliseconds.
-- **Simultaneous ring = duplicate call_ids:** Each ring leg has a unique `call_id`. Use `master_call_id` for callcenter dedup once fixed.
+- **Simultaneous ring dedup:** Use `entry_point_call_id` — shared across all operator legs of the same callcenter call. `master_call_id` is always null, do not use it.
 - **Dialpad payload is plain JSON:** Unlike the dialpad-hubspot-sync Lambda, this one receives raw JSON, not a base64-encoded JWT.
 - **`Unknown User` in HubSpot:** Happens when the agent's identity isn't resolved — the call is logged but attributed to no user. Not a bug in this Lambda, it's a HubSpot limitation when no agent association is set.
 

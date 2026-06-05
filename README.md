@@ -44,8 +44,8 @@ package.json   — dependencies
 
 If no contact is found, the engagement is still created but not associated.
 
-## Known Issue — Duplicate Call Logs
+## Callcenter Call Dedup
 
-Callcenter calls with simultaneous ring create one `hangup` event per agent ring leg, each with a unique `call_id`. Since dedup uses `call_id`, all legs get logged separately.
+Entry point legs (`target.type = coaching_team/callcenter`) are skipped — they have no agent info and were creating "Unknown User" records. Operator legs (`target.type = user`) are logged using `entry_point_call_id` as the dedup key, which is shared across all simultaneous ring legs of the same call.
 
-**Fix:** Use `master_call_id` as the dedup key — it's shared across all legs of the same logical call. Pending fix.
+**Pending (VP decision):** Unanswered callcenter calls are currently not logged.
