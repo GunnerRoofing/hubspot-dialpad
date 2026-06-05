@@ -29,7 +29,31 @@ exports.handler = async (event) => {
   }
 };
 
-async function lookupContact(client, dialpadContactId, fallbackPhone) {
+function normalizePhone(p) {
+  if (!p) return null;
+  const digits = String(p).replace(/\D/g, '');
+  if (!digits) return null;
+  return digits.length === 10 ? `+1${digits}` : `+${digits}`;
+}
+
+async function lookupContact(client, dialpadContactId, rawPhone) {
+  // Phone is the primary key — it's the reliable customer identifier.
+  // dialpad_id is a best-effort fallback only (sparsely populated, can go stale).
+  const phone = normalizePhone(rawPhone);
+  if (phone) {
+    const resp = await client.crm.contacts.searchApi.doSearch({
+      filterGroups: [
+        { filters: [{ propertyName: 'phone', operator: 'EQ', value: phone }] },
+        { filters: [{ propertyName: 'mobilephone', operator: 'EQ', value: phone }] },
+      ],
+      properties: ['firstname', 'lastname', 'phone'],
+      limit: 1,
+    });
+    const found = resp.results?.[0];
+    console.log('PHONE LOOKUP:', phone, '->', found ? `found ${found.id}` : 'not found');
+    if (found) return found;
+  }
+
   if (dialpadContactId) {
     const resp = await client.crm.contacts.searchApi.doSearch({
       filterGroups: [{ filters: [{ propertyName: 'dialpad_id', operator: 'EQ', value: String(dialpadContactId) }] }],
@@ -37,22 +61,8 @@ async function lookupContact(client, dialpadContactId, fallbackPhone) {
       limit: 1,
     });
     const found = resp.results?.[0];
-    console.log('DIALPAD_ID LOOKUP:', dialpadContactId, '->', found ? `found ${found.id}` : 'not found');
+    console.log('DIALPAD_ID FALLBACK:', dialpadContactId, '->', found ? `found ${found.id}` : 'not found');
     if (found) return found;
-  }
-
-  if (fallbackPhone) {
-    const resp = await client.crm.contacts.searchApi.doSearch({
-      filterGroups: [
-        { filters: [{ propertyName: 'phone', operator: 'EQ', value: fallbackPhone }] },
-        { filters: [{ propertyName: 'mobilephone', operator: 'EQ', value: fallbackPhone }] },
-      ],
-      properties: ['firstname', 'lastname', 'phone'],
-      limit: 1,
-    });
-    const found = resp.results?.[0];
-    console.log('PHONE LOOKUP:', fallbackPhone, '->', found ? `found ${found.id}` : 'not found');
-    return found || null;
   }
 
   return null;
