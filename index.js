@@ -11,6 +11,8 @@ exports.handler = async (event) => {
 
   const client = new hubspot.Client({
     accessToken: process.env.HUBSPOT_ACCESS_TOKEN,
+    // Auto-retry on 429 (HubSpot Search has a shared ~4 req/sec SECONDLY cap that bursts blow past).
+    numberOfApiCallRetries: 6,
   });
 
   // Call events carry call_id/external_number. This webhook only receives call-hangups
@@ -46,35 +48,39 @@ function normalizePhone(p) {
 }
 
 async function lookupContact(client, dialpadContactId, rawPhone) {
-  // Phone is the primary key — it's the reliable customer identifier.
-  // dialpad_id is a best-effort fallback only (sparsely populated, can go stale).
+  // ONE search (phone OR mobilephone OR dialpad_id) to stay under the search rate limit.
+  // Phone stays primary: we prefer a phone/mobilephone match over a dialpad_id-only match
+  // (dialpad_id is sparsely populated / can go stale).
   const phone = normalizePhone(rawPhone);
+  const filterGroups = [];
   if (phone) {
-    const resp = await client.crm.contacts.searchApi.doSearch({
-      filterGroups: [
-        { filters: [{ propertyName: 'phone', operator: 'EQ', value: phone }] },
-        { filters: [{ propertyName: 'mobilephone', operator: 'EQ', value: phone }] },
-      ],
-      properties: ['firstname', 'lastname', 'phone'],
-      limit: 1,
-    });
-    const found = resp.results?.[0];
-    console.log('PHONE LOOKUP:', phone, '->', found ? `found ${found.id}` : 'not found');
-    if (found) return found;
+    filterGroups.push({ filters: [{ propertyName: 'phone', operator: 'EQ', value: phone }] });
+    filterGroups.push({ filters: [{ propertyName: 'mobilephone', operator: 'EQ', value: phone }] });
+  }
+  // dialpad_id is a NUMBER property — only filter on it with a numeric value, else the whole
+  // combined search 400s and we'd lose the phone match too.
+  if (dialpadContactId && /^\d+$/.test(String(dialpadContactId))) {
+    filterGroups.push({ filters: [{ propertyName: 'dialpad_id', operator: 'EQ', value: String(dialpadContactId) }] });
+  }
+  if (!filterGroups.length) return null;
+
+  const resp = await client.crm.contacts.searchApi.doSearch({
+    filterGroups,
+    properties: ['firstname', 'lastname', 'phone', 'mobilephone', 'dialpad_id'],
+    limit: 10,
+  });
+  const results = resp.results || [];
+  if (!results.length) {
+    console.log('LOOKUP:', phone || `dpid:${dialpadContactId}`, '-> not found');
+    return null;
   }
 
-  if (dialpadContactId) {
-    const resp = await client.crm.contacts.searchApi.doSearch({
-      filterGroups: [{ filters: [{ propertyName: 'dialpad_id', operator: 'EQ', value: String(dialpadContactId) }] }],
-      properties: ['firstname', 'lastname', 'phone'],
-      limit: 1,
-    });
-    const found = resp.results?.[0];
-    console.log('DIALPAD_ID FALLBACK:', dialpadContactId, '->', found ? `found ${found.id}` : 'not found');
-    if (found) return found;
-  }
-
-  return null;
+  let found = null;
+  if (phone) found = results.find((c) => c.properties.phone === phone || c.properties.mobilephone === phone);
+  if (!found && dialpadContactId) found = results.find((c) => String(c.properties.dialpad_id) === String(dialpadContactId));
+  found = found || results[0];
+  console.log('LOOKUP:', phone || `dpid:${dialpadContactId}`, '-> found', found.id);
+  return found;
 }
 
 async function getContactDeals(client, contactId) {
