@@ -144,9 +144,18 @@ async function handleSmsEvent(client, body) {
 }
 
 async function handleCallEvent(client, body) {
-  // Use master_call_id for callcenter calls (shared across all simultaneous ring legs)
-  // Fall back to call_id for direct calls (no master_call_id present)
-  const dialpadCallId = String(body.master_call_id || body.call_id || body.id);
+  // Skip entry point calls (coaching_team/callcenter target) — no agent info, creates "Unknown User" logs.
+  // TODO: decide whether to log unanswered callcenter calls (entry point fires hangup with no operator leg)
+  const targetType = body.target?.type;
+  if (targetType === 'coaching_team' || targetType === 'callcenter') {
+    console.log('SKIP entry point call — target type:', targetType);
+    return;
+  }
+
+  // Use entry_point_call_id for callcenter operator legs (shared across all simultaneous ring legs).
+  // Fall back to call_id for direct calls (no entry_point_call_id present).
+  // Note: master_call_id is always null in Dialpad payloads — do not use it.
+  const dialpadCallId = String(body.entry_point_call_id || body.call_id || body.id);
   const existing = await client.crm.objects.searchApi.doSearch('calls', {
     filterGroups: [{ filters: [{ propertyName: 'hs_call_external_id', operator: 'EQ', value: dialpadCallId }] }],
     properties: ['hs_call_external_id'],
