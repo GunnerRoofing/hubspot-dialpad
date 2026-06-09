@@ -83,6 +83,22 @@ async function lookupContact(client, dialpadContactId, rawPhone) {
   return found;
 }
 
+async function createMinimalContact(client, rawPhone) {
+  // Unknown SMS sender: create a phone-only contact so the SMS still logs once
+  // native SMS logging (which used to create these) is turned off.
+  const phone = normalizePhone(rawPhone);
+  if (!phone) return null;
+  try {
+    const created = await client.crm.contacts.basicApi.create({ properties: { phone } });
+    console.log('SMS: created minimal contact', created.id, 'for new sender');
+    return created;
+  } catch (err) {
+    // On error (e.g. a concurrent event already created it), fall back to lookup.
+    console.warn('SMS: minimal contact create failed:', err.message);
+    return await lookupContact(client, null, phone);
+  }
+}
+
 async function getContactDeals(client, contactId) {
   // Get deal IDs directly associated to this contact
   const assocResp = await fetch(
@@ -164,10 +180,14 @@ async function handleSmsEvent(client, body) {
     return;
   }
 
-  const contact = await lookupContact(client, body.contact?.id, externalPhone);
+  let contact = await lookupContact(client, body.contact?.id, externalPhone);
   if (!contact) {
-    // Native still creates contacts during this phase; revisit when native is off.
-    console.log('SMS: no contact for', externalPhone, '— skip');
+    // Unknown sender — create a minimal phone-only contact so the SMS still logs
+    // after native SMS logging is turned off (native used to create these).
+    contact = await createMinimalContact(client, externalPhone);
+  }
+  if (!contact) {
+    console.log('SMS: could not resolve or create contact for', externalPhone, '— skip');
     return;
   }
 
