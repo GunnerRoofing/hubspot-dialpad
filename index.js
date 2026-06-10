@@ -83,14 +83,27 @@ async function lookupContact(client, dialpadContactId, rawPhone) {
   return found;
 }
 
-async function createMinimalContact(client, rawPhone) {
+async function lookupOwnerId(client, email) {
+  if (!email) return null;
+  try {
+    const resp = await client.crm.owners.ownersApi.getPage({ email, limit: 1 });
+    return resp.results?.[0]?.id ?? null;
+  } catch (err) {
+    console.warn('SMS: owner lookup failed for', email, err.message);
+    return null;
+  }
+}
+
+async function createMinimalContact(client, rawPhone, ownerId = null) {
   // Unknown SMS sender: create a phone-only contact so the SMS still logs once
   // native SMS logging (which used to create these) is turned off.
   const phone = normalizePhone(rawPhone);
   if (!phone) return null;
+  const properties = { phone };
+  if (ownerId) properties.hubspot_owner_id = ownerId;
   try {
-    const created = await client.crm.contacts.basicApi.create({ properties: { phone } });
-    console.log('SMS: created minimal contact', created.id, 'for new sender');
+    const created = await client.crm.contacts.basicApi.create({ properties });
+    console.log('SMS: created minimal contact', created.id, 'for new sender', ownerId ? `owner=${ownerId}` : 'unowned');
     return created;
   } catch (err) {
     // On error (e.g. a concurrent event already created it), fall back to lookup.
@@ -184,7 +197,11 @@ async function handleSmsEvent(client, body) {
   if (!contact) {
     // Unknown sender — create a minimal phone-only contact so the SMS still logs
     // after native SMS logging is turned off (native used to create these).
-    contact = await createMinimalContact(client, externalPhone);
+    // For outbound, assign to the sending agent so HubSpot's auto-assign doesn't rotate it.
+    const ownerId = body.direction === 'outbound'
+      ? await lookupOwnerId(client, body.target?.email)
+      : null;
+    contact = await createMinimalContact(client, externalPhone, ownerId);
   }
   if (!contact) {
     console.log('SMS: could not resolve or create contact for', externalPhone, '— skip');
