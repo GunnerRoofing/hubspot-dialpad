@@ -68,8 +68,7 @@ Callcenter calls create two types of `hangup` events:
 ## Deploy
 
 ```bash
-cd /Users/leonard.fuentes/Documents/hubspot-dialpad
-./deploy.sh
+./deploy.sh   # run from the repo root
 ```
 
 Zips `index.js`, `node_modules/`, `package.json` and uploads to Lambda directly.
@@ -102,15 +101,3 @@ For any change beyond a single trivial edit:
 - **Simultaneous ring dedup:** Use `entry_point_call_id` — shared across all operator legs of the same callcenter call. `master_call_id` is always null, do not use it.
 - **Dialpad payload is plain JSON:** Unlike the dialpad-hubspot-sync Lambda, this one receives raw JSON, not a base64-encoded JWT.
 - **`Unknown User` in HubSpot:** Happens when the agent's identity isn't resolved — the call is logged but attributed to no user. Not a bug in this Lambda, it's a HubSpot limitation when no agent association is set.
-
-## Anti-Boilerplate
-
-- Do NOT add docstrings to every function
-- Do NOT create placeholder files for features not being built
-- Do NOT add inline boilerplate comments
-
-## Token Efficiency
-
-- Answer first, explain after if needed
-- No preamble, no closing summaries
-- One example is enough
