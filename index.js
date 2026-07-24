@@ -47,46 +47,90 @@ function normalizePhone(p) {
   return digits.length === 10 ? `+1${digits}` : `+${digits}`;
 }
 
-async function lookupContact(client, dialpadContactId, rawPhone) {
-  // ONE search (phone OR mobilephone OR dialpad_id) to stay under the search rate limit.
-  // Phone stays primary: we prefer a phone/mobilephone match over a dialpad_id-only match
-  // (dialpad_id is sparsely populated / can go stale).
-  const phone = normalizePhone(rawPhone);
-  const filterGroups = [];
-  if (phone) {
-    filterGroups.push({ filters: [{ propertyName: 'phone', operator: 'EQ', value: phone }] });
-    filterGroups.push({ filters: [{ propertyName: 'mobilephone', operator: 'EQ', value: phone }] });
-  }
-  // dialpad_id is a NUMBER property — only filter on it with a numeric value, else the whole
-  // combined search 400s and we'd lose the phone match too.
-  if (dialpadContactId && /^\d+$/.test(String(dialpadContactId))) {
-    filterGroups.push({ filters: [{ propertyName: 'dialpad_id', operator: 'EQ', value: String(dialpadContactId) }] });
-  }
-  if (!filterGroups.length) return null;
+// HubSpot maintains hs_searchable_calculated_phone_number / _mobile_number as the
+// formatting-stripped form of phone/mobilephone, so matching on those finds a contact no
+// matter how the number was typed (parens, dashes, spaces, leading 1, etc.). US numbers
+// are stored as the bare 10-digit national number (verified: "2034246582" matches a
+// contact saved as "+1 (203) 424-6582"); we also pass the country-coded and E.164 forms
+// so non-US numbers still match.
+function searchablePhoneValues(phone) {
+  const digits = phone.replace(/\D/g, '');
+  const vals = new Set([digits, `+${digits}`]);
+  if (digits.length === 11 && digits.startsWith('1')) vals.add(digits.slice(1));
+  if (digits.length === 10) { vals.add(`1${digits}`); vals.add(`+1${digits}`); }
+  return [...vals];
+}
 
+async function searchByPhone(client, phone) {
+  // Match on HubSpot's normalized searchable phone properties (one IN filter per field,
+  // OR'd together) so any stored format resolves to the same contact. This is the "find
+  // before create" guard — the old EQ-on-guessed-formats search missed unlisted formats
+  // and spawned duplicate contacts (and, via the lifecycle automation, duplicate leads).
+  const values = searchablePhoneValues(phone);
   const resp = await client.crm.contacts.searchApi.doSearch({
-    filterGroups,
+    filterGroups: [
+      { filters: [{ propertyName: 'hs_searchable_calculated_phone_number', operator: 'IN', values }] },
+      { filters: [{ propertyName: 'hs_searchable_calculated_mobile_number', operator: 'IN', values }] },
+    ],
     properties: ['firstname', 'lastname', 'phone', 'mobilephone', 'dialpad_id'],
     limit: 10,
   });
-  const results = resp.results || [];
+  return resp.results || [];
+}
+
+async function lookupContact(client, dialpadContactId, rawPhone) {
+  const phone = normalizePhone(rawPhone);
+  const properties = ['firstname', 'lastname', 'phone', 'mobilephone', 'dialpad_id'];
+
+  // Primary search: all phone variants (phone field, then mobilephone field).
+  let results = phone ? await searchByPhone(client, phone) : [];
+
+  // Fallback: dialpad_id (sparsely populated but worth trying if phone missed).
+  if (!results.length && dialpadContactId && /^\d+$/.test(String(dialpadContactId))) {
+    const resp = await client.crm.contacts.searchApi.doSearch({
+      filterGroups: [{ filters: [{ propertyName: 'dialpad_id', operator: 'EQ', value: String(dialpadContactId) }] }],
+      properties,
+      limit: 10,
+    });
+    results = resp.results || [];
+  }
+
   if (!results.length) {
     console.log('LOOKUP:', phone || `dpid:${dialpadContactId}`, '-> not found');
     return null;
   }
 
+  if (results.length > 1) console.log('LOOKUP: multiple matches for', phone, '— using best match');
+  // All results already match the number (searched on the normalized property). Prefer the
+  // dialpad_id match, then a "real" named contact over a phone-only placeholder, so we attach
+  // to the canonical contact rather than a stray duplicate.
   let found = null;
-  if (phone) found = results.find((c) => c.properties.phone === phone || c.properties.mobilephone === phone);
-  if (!found && dialpadContactId) found = results.find((c) => String(c.properties.dialpad_id) === String(dialpadContactId));
+  if (dialpadContactId) found = results.find((c) => String(c.properties.dialpad_id) === String(dialpadContactId));
+  if (!found) found = results.find((c) => c.properties.firstname || c.properties.lastname);
   found = found || results[0];
   console.log('LOOKUP:', phone || `dpid:${dialpadContactId}`, '-> found', found.id);
   return found;
 }
 
+// Owner-id by email, cached for the container's life so a single blast (one sender, many messages)
+// costs at most one owner lookup instead of one per message (protects the shared ~4/sec Search cap).
+const _ownerIdByEmail = new Map();
+async function ownerIdForEmail(client, email) {
+  if (!email) return null;
+  const key = email.toLowerCase();
+  if (_ownerIdByEmail.has(key)) return _ownerIdByEmail.get(key);
+  const id = await lookupOwnerId(client, email);
+  _ownerIdByEmail.set(key, id);
+  return id;
+}
+
 async function lookupOwnerId(client, email) {
   if (!email) return null;
   try {
-    const resp = await client.crm.owners.ownersApi.getPage({ email, limit: 1 });
+    // getPage is POSITIONAL (email, after, limit, archived) — passing an object made the email
+    // filter "[object Object]" → 0 results → every owner lookup returned null (the real reason
+    // outbound SMS contacts were unowned). Filter by email positionally.
+    const resp = await client.crm.owners.ownersApi.getPage(email, undefined, 1);
     return resp.results?.[0]?.id ?? null;
   } catch (err) {
     console.warn('SMS: owner lookup failed for', email, err.message);
@@ -94,13 +138,96 @@ async function lookupOwnerId(client, email) {
   }
 }
 
-async function createMinimalContact(client, rawPhone, ownerId = null) {
+// Map an outbound SMS's sending line (from_number) → agent email via a STATIC directory in the
+// SMS_SENDER_OWNER_MAP env var (JSON { "+1NXXNXXXXXX": "agent@gunnerroofing.com", ... }, built from
+// Dialpad /users). Resolved with ZERO API calls: a bulk "blaster" fans out to many concurrent Lambda
+// containers, and calling Dialpad /users from each one caused a thundering-herd 400 storm → every
+// blast contact fell back to unowned → round-robin onto reps. The static map removes that dependency
+// (deterministic, no herd, no rate limit). Returns null for an unmapped line (e.g. an office/campaign
+// number not in the directory) → caller leaves the contact unowned (unchanged) and logs the line so
+// it can be added. Regenerate the env map when agents/numbers change.
+// Built from Dialpad /api/v2/users 2026-06-24. Internal sending lines (agent DIDs) → owner email.
+// REGENERATE when agents/numbers change. Override at runtime by setting SMS_SENDER_OWNER_MAP (JSON)
+// — the env takes precedence so this can be updated without a code deploy.
+const SENDER_OWNER_MAP = {
+  "+12037631819": "bryce.falk@gunnerroofing.com",
+  "+12037144867": "campbell.schulz@gunnerroofing.com",
+  "+19732215872": "chris.manfredo@gunnerroofing.com",
+  "+19735549912": "doug.kilzer@gunnerroofing.com",
+  "+19735673765": "eddie@gunnerroofing.com",
+  "+19732215942": "eric.recchia@gunnerroofing.com",
+  "+19145597530": "frank.gianchetta@gunnerroofing.com",
+  "+12037144873": "glen.tacinelli@gunnerroofing.com",
+  "+19735673690": "admin@gunnerroofing.com",
+  "+12033473345": "jeff.witkowski@gunnerroofing.com",
+  "+12037144866": "jennie.spangenberg@gunnerroofing.com",
+  "+19733217191": "jesse.applegate@gunnerroofing.com",
+  "+12037144874": "joe@gunnerroofing.com",
+  "+19145371341": "john.miller@gunnerroofing.com",
+  "+14402521959": "john.miller@gunnerroofing.com",
+  "+12037144877": "john.miller@gunnerroofing.com",
+  "+12037144868": "joseph.muratori@gunnerroofing.com",
+  "+12037144870": "kauanny.zanetti@gunnerroofing.com",
+  "+19734578938": "kevin.lewis@gunnerroofing.com",
+  "+18602001795": "kevin.lovely@gunnerroofing.com",
+  "+19145597991": "leslie@gunnerroofing.com",
+  "+14409414938": "leslie@gunnerroofing.com",
+  "+15703545132": "leslie@gunnerroofing.com",
+  "+19736207538": "leslie@gunnerroofing.com",
+  "+12035877738": "michael.ushka@gunnerroofing.com",
+  "+12033093665": "nicole.almeida@gunnerroofing.com",
+  "+12034470569": "pamela.foley@gunnerroofing.com",
+  "+14402070506": "pamela.foley@gunnerroofing.com",
+  "+12015911000": "pamela.foley@gunnerroofing.com",
+  "+19144277730": "pamela.foley@gunnerroofing.com",
+  "+15702341087": "pamela.foley@gunnerroofing.com",
+  "+12037144862": "sarah.gengo@gunnerroofing.com",
+  "+19735247478": "thomas.gatto@gunnerroofing.com",
+  "+18607923047": "zachary.webb@gunnerroofing.com",
+  "+19148268893": "solar@gunnerroofing.com",
+};
+let _senderMap = null;
+function senderMap() {
+  if (_senderMap) return _senderMap;
+  if (process.env.SMS_SENDER_OWNER_MAP) {
+    try {
+      _senderMap = JSON.parse(process.env.SMS_SENDER_OWNER_MAP);
+      return _senderMap;
+    } catch (err) {
+      console.warn('SMS: SMS_SENDER_OWNER_MAP env is not valid JSON, using built-in map —', err.message);
+    }
+  }
+  _senderMap = SENDER_OWNER_MAP;
+  return _senderMap;
+}
+function dialpadEmailForNumber(rawNumber) {
+  const phone = normalizePhone(rawNumber);
+  if (!phone) return null;
+  return senderMap()[phone] || null;
+}
+
+async function createMinimalContact(client, rawPhone, ownerId = null, dialpadContactId = null) {
   // Unknown SMS sender: create a phone-only contact so the SMS still logs once
   // native SMS logging (which used to create these) is turned off.
   const phone = normalizePhone(rawPhone);
   if (!phone) return null;
+  // Guard against malformed/partial numbers (e.g. "+187849"): they never match an existing
+  // contact, so each spawns a junk placeholder contact + an auto-created lead. Require a
+  // plausible length (10-digit US through 15-digit E.164) before creating.
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length < 10 || digits.length > 15) {
+    console.warn('SMS: refusing to create contact for implausible number', phone);
+    return null;
+  }
   const properties = { phone };
   if (ownerId) properties.hubspot_owner_id = ownerId;
+  // Stamp Dialpad's contact ID when the webhook provides it (only present when Dialpad
+  // recognizes the sender). This makes the dialpad_id lookup fallback functional for our
+  // own contacts and gives Dialpad's native sync a key to match on instead of spawning a
+  // parallel duplicate.
+  if (dialpadContactId && /^\d+$/.test(String(dialpadContactId))) {
+    properties.dialpad_id = String(dialpadContactId);
+  }
   try {
     const created = await client.crm.contacts.basicApi.create({ properties });
     console.log('SMS: created minimal contact', created.id, 'for new sender', ownerId ? `owner=${ownerId}` : 'unowned');
@@ -197,11 +324,37 @@ async function handleSmsEvent(client, body) {
   if (!contact) {
     // Unknown sender — create a minimal phone-only contact so the SMS still logs
     // after native SMS logging is turned off (native used to create these).
-    // For outbound, assign to the sending agent so HubSpot's auto-assign doesn't rotate it.
-    const ownerId = body.direction === 'outbound'
-      ? await lookupOwnerId(client, body.target?.email)
-      : null;
-    contact = await createMinimalContact(client, externalPhone, ownerId);
+    // For OUTBOUND, own the new contact by the SENDING AGENT so HubSpot's round-robin auto-assign
+    // doesn't rotate it onto random reps (the blaster created hundreds of unowned contacts this way).
+    // Resolve the sender: (1) target.email if present, (2) the sending line (from_number) → Dialpad
+    // agent → owner — this is what attributes a blast (sent from an agent's number) to that agent.
+    // No blanket default: an unresolved sender stays unowned (unchanged), never dumped on one rep.
+    let ownerId = null;
+    let ownerVia = 'none';
+    if (body.direction === 'outbound') {
+      if (body.target?.email) {
+        ownerId = await ownerIdForEmail(client, body.target.email);
+        if (ownerId) ownerVia = 'target.email';
+      }
+      let senderEmail = null;
+      if (!ownerId) {
+        senderEmail = dialpadEmailForNumber(body.from_number);
+        if (senderEmail) {
+          ownerId = await ownerIdForEmail(client, senderEmail);
+          if (ownerId) ownerVia = 'from_number';
+        }
+      }
+      if (ownerId) {
+        console.log('SMS: outbound new-contact owner', `${ownerId} (via ${ownerVia})`);
+      } else if (senderEmail) {
+        // Sender line IS mapped but the HubSpot owner lookup returned nothing — distinct from unmapped.
+        console.log('SMS: outbound new-contact UNOWNED — owner not found for sender', senderEmail);
+      } else {
+        // Sending line not in the map (a company DID/office line — not customer PII); add it to the map.
+        console.log('SMS: outbound new-contact UNOWNED — unmapped sender line', normalizePhone(body.from_number) || '(none)');
+      }
+    }
+    contact = await createMinimalContact(client, externalPhone, ownerId, body.contact?.id);
   }
   if (!contact) {
     console.log('SMS: could not resolve or create contact for', externalPhone, '— skip');
