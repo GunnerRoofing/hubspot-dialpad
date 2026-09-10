@@ -6,6 +6,8 @@ const {
   normalizePhone,
   searchablePhoneValues,
   lockPk,
+  looksLikePhone,
+  emailsFromDialpadContact,
   nameFromDialpadContact,
   pickBestContact,
   resolveOrCreateContact,
@@ -41,6 +43,29 @@ test('nameFromDialpadContact prefers first/last then splits name', () => {
   assert.deepEqual(nameFromDialpadContact(null), { first: null, last: null });
 });
 
+test('nameFromDialpadContact ignores phone-shaped names', () => {
+  assert.equal(looksLikePhone('(440) 541-4992'), true);
+  assert.deepEqual(
+    nameFromDialpadContact({ name: '(440) 541-4992' }, '+14405414992'),
+    { first: null, last: null },
+  );
+  assert.deepEqual(
+    nameFromDialpadContact({ first_name: '(862)', last_name: '273-7193' }, '+18622737193'),
+    { first: null, last: null },
+  );
+  assert.deepEqual(
+    nameFromDialpadContact({ name: 'Ada Lovelace' }, '+14405414992'),
+    { first: 'Ada', last: 'Lovelace' },
+  );
+});
+
+test('emailsFromDialpadContact reads string and object arrays', () => {
+  assert.deepEqual(
+    emailsFromDialpadContact({ email: 'Ada@X.com', emails: [{ address: 'ada@x.com' }, 'other@x.com'] }),
+    ['ada@x.com', 'other@x.com'],
+  );
+});
+
 test('pickBestContact prefers dialpad_id then a named row', () => {
   const blank = { id: '1', properties: { phone: '+15551111' } };
   const named = { id: '2', properties: { firstname: 'Ada', lastname: 'L' } };
@@ -51,12 +76,16 @@ test('pickBestContact prefers dialpad_id then a named row', () => {
   assert.equal(pickBestContact([], null), null);
 });
 
-function mockClient({ searchResults = [], created = { id: 'new' }, updates = [] }) {
+function mockClient({ searchResults = [], emailResults = [], created = { id: 'new' }, updates = [] }) {
   return {
     crm: {
       contacts: {
         searchApi: {
-          doSearch: async () => ({ results: searchResults }),
+          doSearch: async (payload) => {
+            const groups = payload.filterGroups || [];
+            const isEmail = groups.some((g) => g.filters?.[0]?.propertyName === 'email');
+            return { results: isEmail ? emailResults : searchResults };
+          },
         },
         basicApi: {
           create: async ({ properties }) => {
@@ -147,6 +176,70 @@ test('lock held — never create', async () => {
   });
   assert.equal(contact, null);
   assert.equal(created, 0);
+});
+
+test('phone-shaped Dialpad name is not copied onto create', async () => {
+  const created = { id: 'n' };
+  const client = mockClient({ searchResults: [], created });
+  await resolveOrCreateContact({
+    client,
+    ddb: { send: async () => ({}) },
+    table: 't',
+    rawPhone: '+14405414992',
+    dialpadContact: { name: '(440) 541-4992' },
+  });
+  assert.equal(created.properties.firstname, undefined);
+  assert.equal(created.properties.lastname, undefined);
+  assert.equal(created.properties.phone, '+14405414992');
+});
+
+test('email match stamps phone when HS row has none', async () => {
+  const existing = {
+    id: 'email-only',
+    properties: { email: 'lizavargheseam@gmail.com', firstname: 'Liza', lastname: 'Varghese' },
+  };
+  const updates = [];
+  const client = mockClient({ searchResults: [], emailResults: [existing] });
+  client.crm.contacts.basicApi.update = async (id, { properties }) => {
+    updates.push({ id, properties });
+    return { id, properties: { ...existing.properties, ...properties } };
+  };
+  const contact = await resolveOrCreateContact({
+    client,
+    ddb: { send: async () => { throw new Error('lock should not run'); } },
+    table: 't',
+    rawPhone: '+15168602351',
+    dialpadContact: { name: 'Liza Varghese', emails: ['lizavargheseam@gmail.com'] },
+  });
+  assert.equal(contact.id, 'email-only');
+  assert.equal(updates[0].properties.phone, '+15168602351');
+  assert.equal(updates[0].properties.firstname, undefined);
+});
+
+test('email match does not overwrite a different existing phone', async () => {
+  const existing = {
+    id: 'has-phone',
+    properties: {
+      email: 'a@x.com',
+      phone: '+15550001111',
+      firstname: 'Ada',
+    },
+  };
+  const updates = [];
+  const client = mockClient({ searchResults: [], emailResults: [existing] });
+  client.crm.contacts.basicApi.update = async (id, { properties }) => {
+    updates.push({ id, properties });
+    return { id, properties };
+  };
+  const contact = await resolveOrCreateContact({
+    client,
+    ddb: { send: async () => { throw new Error('lock should not run'); } },
+    table: 't',
+    rawPhone: '+15168602351',
+    dialpadContact: { emails: ['a@x.com'] },
+  });
+  assert.equal(contact.id, 'has-phone');
+  assert.ok(!updates.some((u) => u.properties.phone));
 });
 
 test('lock Dynamo error — never create', async () => {

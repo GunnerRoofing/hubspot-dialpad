@@ -31,20 +31,61 @@ function lockPk(phoneE164) {
   return `DP#PHONE_LOCK#${String(phoneE164 || '').replace(/\D/g, '')}`;
 }
 
-function nameFromDialpadContact(contact) {
+function looksLikePhone(s, againstE164) {
+  const d = String(s || '').replace(/\D/g, '');
+  if (d.length < 10) return false;
+  if (againstE164) {
+    const p = String(againstE164).replace(/\D/g, '');
+    if (p && (d === p || d === p.slice(-10) || (p.endsWith(d) && d.length >= 10))) return true;
+  }
+  return d.length === 10 || (d.length === 11 && d.startsWith('1'));
+}
+
+function emailsFromDialpadContact(contact) {
+  if (!contact || typeof contact !== 'object') return [];
+  const out = [];
+  const add = (e) => {
+    const s = String(e || '').trim().toLowerCase();
+    if (s.includes('@')) out.push(s);
+  };
+  add(contact.email);
+  const list = contact.emails;
+  if (Array.isArray(list)) {
+    for (const item of list) {
+      if (typeof item === 'string') add(item);
+      else if (item && typeof item === 'object') add(item.email || item.address);
+    }
+  }
+  return [...new Set(out)];
+}
+
+function nameFromDialpadContact(contact, againstPhone) {
   if (!contact || typeof contact !== 'object') return { first: null, last: null };
-  const first = (contact.first_name || contact.firstname || '').trim() || null;
-  const last = (contact.last_name || contact.lastname || '').trim() || null;
-  if (first || last) return { first, last };
-  const name = String(contact.name || '').trim();
-  if (!name) return { first: null, last: null };
-  const parts = name.split(/\s+/);
-  return { first: parts[0] || null, last: parts.slice(1).join(' ') || null };
+  let first = (contact.first_name || contact.firstname || '').trim() || null;
+  let last = (contact.last_name || contact.lastname || '').trim() || null;
+  if (!first && !last) {
+    const name = String(contact.name || '').trim();
+    if (name) {
+      const parts = name.split(/\s+/);
+      first = parts[0] || null;
+      last = parts.slice(1).join(' ') || null;
+    }
+  }
+  const combined = [first, last].filter(Boolean).join(' ');
+  const packed = `${first || ''}${last || ''}`;
+  if (looksLikePhone(combined, againstPhone) || looksLikePhone(packed, againstPhone)) {
+    return { first: null, last: null };
+  }
+  return { first, last };
 }
 
 function hasName(c) {
   const p = c?.properties || {};
-  return Boolean((p.firstname || '').trim() || (p.lastname || '').trim());
+  const first = (p.firstname || '').trim();
+  const last = (p.lastname || '').trim();
+  if (!first && !last) return false;
+  if (looksLikePhone(`${first} ${last}`) || looksLikePhone(`${first}${last}`)) return false;
+  return true;
 }
 
 function pickBestContact(results, dialpadContactId) {
@@ -112,7 +153,7 @@ async function findExistingContact(client, rawPhone, dialpadContactId) {
 }
 
 async function lookupByPhoneAndDialpad(client, phoneE164, dialpadContactId) {
-  const properties = ['firstname', 'lastname', 'phone', 'mobilephone', 'dialpad_id'];
+  const properties = ['firstname', 'lastname', 'phone', 'mobilephone', 'email', 'dialpad_id'];
   const values = phoneE164 ? searchablePhoneValues(phoneE164) : [];
   const filterGroups = [];
   if (values.length) {
@@ -137,15 +178,43 @@ async function lookupByPhoneAndDialpad(client, phoneE164, dialpadContactId) {
   return resp.results || [];
 }
 
-async function enrichIfBlank(client, contact, { first, last, dialpadId }) {
+async function lookupByEmail(client, emails) {
+  const list = (emails || []).filter((e) => e && e.includes('@'));
+  if (!list.length) return [];
+  const properties = ['firstname', 'lastname', 'phone', 'mobilephone', 'email', 'dialpad_id'];
+  const filterGroups = list.slice(0, 5).map((email) => ({
+    filters: [{ propertyName: 'email', operator: 'EQ', value: email }],
+  }));
+  const resp = await client.crm.contacts.searchApi.doSearch({
+    filterGroups,
+    properties,
+    limit: 10,
+  });
+  return resp.results || [];
+}
+
+function storedPhoneDigits(contact) {
+  const p = contact?.properties || {};
+  const raw = `${p.phone || ''} ${p.mobilephone || ''}`;
+  return String(raw).replace(/\D/g, '');
+}
+
+async function enrichIfBlank(client, contact, { first, last, dialpadId, phone }) {
   if (!contact?.id) return contact;
   const p = contact.properties || {};
   const patch = {};
-  if (!String(p.firstname || '').trim() && first) patch.firstname = first;
-  if (!String(p.lastname || '').trim() && last) patch.lastname = last;
+  const existingFirst = String(p.firstname || '').trim();
+  const existingLast = String(p.lastname || '').trim();
+  const existingPhoneShaped = looksLikePhone(`${existingFirst} ${existingLast}`)
+    || looksLikePhone(`${existingFirst}${existingLast}`);
+  if (first && (!existingFirst || existingPhoneShaped)) patch.firstname = first;
+  if (last && (!existingLast || existingPhoneShaped)) patch.lastname = last;
   if (!String(p.dialpad_id || '').trim() && dialpadId && /^\d+$/.test(String(dialpadId))) {
     patch.dialpad_id = String(dialpadId);
   }
+  const have = storedPhoneDigits(contact);
+  const incoming = String(phone || '').replace(/\D/g, '');
+  if (incoming && !have) patch.phone = phone;
   if (!Object.keys(patch).length) return contact;
   try {
     const updated = await client.crm.contacts.basicApi.update(contact.id, { properties: patch });
@@ -193,17 +262,25 @@ async function resolveOrCreateContact(opts) {
     console.warn('CONTACT refuse create — implausible number', rawPhone);
     return null;
   }
-  const names = nameFromDialpadContact(dialpadContact);
-  const lookup = async () => pickBestContact(
-    await lookupByPhoneAndDialpad(client, phone, dialpadContactId),
-    dialpadContactId,
-  );
+  const names = nameFromDialpadContact(dialpadContact, phone);
+  const emails = emailsFromDialpadContact(dialpadContact);
+  const lookup = async () => {
+    const byPhone = pickBestContact(
+      await lookupByPhoneAndDialpad(client, phone, dialpadContactId),
+      dialpadContactId,
+    );
+    if (byPhone) return byPhone;
+    if (!emails.length) return null;
+    const byEmail = pickBestContact(await lookupByEmail(client, emails), dialpadContactId);
+    if (byEmail) console.log('LOOKUP:', phone, '-> email', emails[0], 'found', byEmail.id);
+    return byEmail;
+  };
 
   let found = await lookup();
   if (found) {
     console.log('LOOKUP:', phone, '-> found', found.id);
     return enrichIfBlank(client, found, {
-      first: names.first, last: names.last, dialpadId: dialpadContactId,
+      first: names.first, last: names.last, dialpadId: dialpadContactId, phone,
     });
   }
   console.log('LOOKUP:', phone, '-> not found');
@@ -216,7 +293,7 @@ async function resolveOrCreateContact(opts) {
       if (found) {
         console.log('LOOKUP after lock miss:', phone, '-> found', found.id);
         return enrichIfBlank(client, found, {
-          first: names.first, last: names.last, dialpadId: dialpadContactId,
+          first: names.first, last: names.last, dialpadId: dialpadContactId, phone,
         });
       }
     }
@@ -227,7 +304,7 @@ async function resolveOrCreateContact(opts) {
   found = await lookup();
   if (found) {
     return enrichIfBlank(client, found, {
-      first: names.first, last: names.last, dialpadId: dialpadContactId,
+      first: names.first, last: names.last, dialpadId: dialpadContactId, phone,
     });
   }
 
@@ -253,6 +330,8 @@ module.exports = {
   normalizePhone,
   searchablePhoneValues,
   lockPk,
+  looksLikePhone,
+  emailsFromDialpadContact,
   nameFromDialpadContact,
   pickBestContact,
   tryAcquireCreateLock,
