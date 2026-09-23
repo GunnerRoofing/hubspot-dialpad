@@ -5,7 +5,7 @@ FUNCTION_NAME="hubspot-dialpad-webhook"
 REGION="us-east-2"
 
 echo "Zipping..."
-zip -r function.zip index.js contactIdentity.js node_modules/ package.json
+zip -r function.zip index.js contactIdentity.js busMap.js node_modules/ package.json
 
 echo "Deploying to Lambda..."
 aws lambda update-function-code \

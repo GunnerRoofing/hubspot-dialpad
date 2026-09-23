@@ -5,16 +5,26 @@ const {
   resolveOrCreateContact,
   makeDdbClient,
 } = require('./contactIdentity');
+const { mapBusEvent } = require('./busMap');
 
 const ddb = makeDdbClient();
 
 exports.handler = async (event) => {
   let body = {};
-  try {
-    body = JSON.parse(event.body || '{}');
-  } catch (e) {
-    console.log('PARSE FAIL | isB64:', event.isBase64Encoded, '| raw80:', String(event.body).slice(0, 80));
-    return respond(200, { status: 'skipped', reason: 'unparseable body' });
+  if (event && event.source === 'gunner.comms-admin') {
+    body = mapBusEvent(event);
+    if (!body) {
+      console.log('BUS skip', event['detail-type'], 'inserted', event.detail && event.detail.inserted);
+      return respond(200, { status: 'skipped', reason: 'bus event not logged' });
+    }
+    console.log('BUS', event['detail-type'], body.call_id ? 'call' : 'sms', body.id || body.call_id);
+  } else {
+    try {
+      body = JSON.parse(event.body || '{}');
+    } catch (e) {
+      console.log('PARSE FAIL | isB64:', event.isBase64Encoded, '| raw80:', String(event.body).slice(0, 80));
+      return respond(200, { status: 'skipped', reason: 'unparseable body' });
+    }
   }
 
   const client = new hubspot.Client({
