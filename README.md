@@ -13,7 +13,7 @@ Lambda that logs Dialpad calls and SMS messages as HubSpot engagement records, a
 
 ## Stack
 
-- Node.js, AWS Lambda (us-east-2)
+- Node.js 24, AWS Lambda (us-east-2)
 - `@hubspot/api-client` v13
 - Plain JSON webhooks from Dialpad (no JWT)
 
@@ -21,7 +21,7 @@ Lambda that logs Dialpad calls and SMS messages as HubSpot engagement records, a
 
 ```
 index.js       — Lambda handler (calls + SMS)
-deploy.sh      — zip and upload to Lambda
+deploy.sh      — zip, upload, and set the Lambda runtime to Node.js 24
 package.json   — dependencies
 ```
 
@@ -36,6 +36,10 @@ package.json   — dependencies
 ```bash
 ./deploy.sh
 ```
+
+`deploy.sh` uploads a fresh code archive, waits for the update, sets the Lambda
+runtime to `nodejs24.x`, and waits for that in-place update. It does not change
+environment variables. Live handler verification is still required after deployment.
 
 ## How Contact Lookup Works
 
