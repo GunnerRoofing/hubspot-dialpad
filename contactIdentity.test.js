@@ -147,6 +147,39 @@ test('resolveOrCreateContact reuses named existing contact and stamps blank fiel
   assert.equal(updates[0].properties.firstname, undefined);
 });
 
+test('creation policy off still reuses an existing contact', async () => {
+  const existing = {
+    id: 'existing',
+    properties: { firstname: 'Ada', lastname: 'Lovelace', phone: '+19179692050' },
+  };
+  const contact = await resolveOrCreateContact({
+    client: mockClient({ searchResults: [existing] }),
+    ddb: { send: async () => { throw new Error('lock should not run'); } },
+    table: 'dialpad-contact-create-locks',
+    rawPhone: '+19179692050',
+    allowCreate: false,
+  });
+  assert.equal(contact.id, 'existing');
+});
+
+test('creation policy off never locks or creates an unknown contact', async () => {
+  let created = 0;
+  const client = mockClient({ searchResults: [] });
+  client.crm.contacts.basicApi.create = async () => {
+    created += 1;
+    return { id: 'should-not' };
+  };
+  const contact = await resolveOrCreateContact({
+    client,
+    ddb: { send: async () => { throw new Error('lock should not run'); } },
+    table: 'dialpad-contact-create-locks',
+    rawPhone: '+19179692050',
+    allowCreate: false,
+  });
+  assert.equal(contact, null);
+  assert.equal(created, 0);
+});
+
 test('resolveOrCreateContact refuses short numbers', async () => {
   const contact = await resolveOrCreateContact({
     client: mockClient({}),
