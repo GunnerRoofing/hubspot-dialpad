@@ -6,6 +6,10 @@ const {
   makeDdbClient,
 } = require('./contactIdentity');
 const { mapBusEvent } = require('./busMap');
+const {
+  ownerCanCreateOutboundContact,
+  displayNameFromEmail,
+} = require('./smsPolicy');
 
 const ddb = makeDdbClient();
 
@@ -62,26 +66,24 @@ async function lookupContact(client, dialpadContactId, rawPhone) {
   return findExistingContact(client, rawPhone, dialpadContactId);
 }
 
-// Owner-id by email, cached for the container's life so a single blast (one sender, many messages)
-// costs at most one owner lookup instead of one per message (protects the shared ~4/sec Search cap).
-const _ownerIdByEmail = new Map();
-async function ownerIdForEmail(client, email) {
+// Cache the full owner record: team membership decides whether an unknown outbound
+// recipient is a legitimate sales lead or a post-sale number that must not enter the funnel.
+const _ownerByEmail = new Map();
+async function ownerForEmail(client, email) {
   if (!email) return null;
   const key = email.toLowerCase();
-  if (_ownerIdByEmail.has(key)) return _ownerIdByEmail.get(key);
-  const id = await lookupOwnerId(client, email);
-  _ownerIdByEmail.set(key, id);
-  return id;
+  if (_ownerByEmail.has(key)) return _ownerByEmail.get(key);
+  const owner = await lookupOwner(client, email);
+  _ownerByEmail.set(key, owner);
+  return owner;
 }
 
-async function lookupOwnerId(client, email) {
+async function lookupOwner(client, email) {
   if (!email) return null;
   try {
-    // getPage is POSITIONAL (email, after, limit, archived) — passing an object made the email
-    // filter "[object Object]" → 0 results → every owner lookup returned null (the real reason
-    // outbound SMS contacts were unowned). Filter by email positionally.
+    // getPage is positional: email, after, limit, archived.
     const resp = await client.crm.owners.ownersApi.getPage(email, undefined, 1);
-    return resp.results?.[0]?.id ?? null;
+    return resp.results?.[0] ?? null;
   } catch (err) {
     console.warn('SMS: owner lookup failed for', email, err.message);
     return null;
@@ -203,10 +205,15 @@ function escapeHtml(s) {
 // One message line, native-style: <strong>Name</strong> <em>[ts ET]</em>: text
 // (No hidden marker — HubSpot strips HTML comments. Dedup matches the whole line, which
 // embeds the per-message timestamp + text, so a re-sent message yields an identical line.)
-function buildSmsLine(body, text, tsMs) {
+function buildSmsLine(body, text, tsMs, senderEmail = null) {
   const name = body.direction === 'inbound'
     ? (body.contact?.name || body.from_number || 'Customer')
-    : (body.target?.name || 'Agent');
+    : (
+      body.target?.name
+      || displayNameFromEmail(senderEmail)
+      || body.from_number
+      || 'Agent'
+    );
   const ts = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', hour12: false,
@@ -237,29 +244,26 @@ async function handleSmsEvent(client, body) {
     return;
   }
 
-  // For OUTBOUND creates, own the new contact by the sending agent so HubSpot
-  // round-robin does not dump blanks onto random reps. Inbound unknown stays unowned.
-  let ownerId = null;
+  let owner = null;
+  let senderEmail = null;
+  let allowCreate = true;
   if (body.direction === 'outbound') {
-    let ownerVia = 'none';
-    let senderEmail = null;
-    if (body.target?.email) {
-      ownerId = await ownerIdForEmail(client, body.target.email);
-      if (ownerId) ownerVia = 'target.email';
-    }
-    if (!ownerId) {
-      senderEmail = dialpadEmailForNumber(body.from_number);
-      if (senderEmail) {
-        ownerId = await ownerIdForEmail(client, senderEmail);
-        if (ownerId) ownerVia = 'from_number';
+    senderEmail = body.target?.email || null;
+    owner = await ownerForEmail(client, senderEmail);
+
+    if (!owner) {
+      const mappedEmail = dialpadEmailForNumber(body.from_number);
+      if (mappedEmail) {
+        senderEmail = mappedEmail;
+        owner = await ownerForEmail(client, mappedEmail);
       }
     }
-    if (ownerId) {
-      console.log('SMS: outbound new-contact owner', `${ownerId} (via ${ownerVia})`);
-    } else if (senderEmail) {
-      console.log('SMS: outbound new-contact UNOWNED — owner not found for sender', senderEmail);
+
+    allowCreate = ownerCanCreateOutboundContact(owner);
+    if (allowCreate) {
+      console.log('SMS: outbound unknown-contact creation allowed for sales sender', senderEmail);
     } else {
-      console.log('SMS: outbound new-contact UNOWNED — unmapped sender line', normalizePhone(body.from_number) || '(none)');
+      console.log('SMS: outbound unknown-contact creation blocked for non-sales sender', senderEmail || '(unmapped)');
     }
   }
 
@@ -270,7 +274,8 @@ async function handleSmsEvent(client, body) {
     rawPhone: externalPhone,
     dialpadContactId: body.contact?.id,
     dialpadContact: body.contact,
-    ownerId,
+    ownerId: owner?.id || null,
+    allowCreate,
     ttlSec: Number(process.env.CREATE_LOCK_TTL_SEC || 600),
   });
   if (!contact) {
@@ -282,7 +287,7 @@ async function handleSmsEvent(client, body) {
   // Keyed deterministically by hs_engagement_source_id so we can find today's thread.
   const tsMs = Number(body.created_date) || Date.now();
   const threadKey = `dpthread-${contact.id}-${easternDayKey(tsMs)}`;
-  const line = buildSmsLine(body, messageBody, tsMs);
+  const line = buildSmsLine(body, messageBody, tsMs, senderEmail);
 
   const existing = await client.crm.objects.searchApi.doSearch('communications', {
     filterGroups: [{ filters: [{ propertyName: 'hs_engagement_source_id', operator: 'EQ', value: threadKey }] }],

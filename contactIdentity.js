@@ -254,6 +254,7 @@ async function resolveOrCreateContact(opts) {
     dialpadContactId = null,
     dialpadContact = null,
     ownerId = null,
+    allowCreate = true,
     ttlSec = 600,
     retryDelayMs = 350,
   } = opts;
@@ -284,6 +285,10 @@ async function resolveOrCreateContact(opts) {
     });
   }
   console.log('LOOKUP:', phone, '-> not found');
+  if (!allowCreate) {
+    console.log('CONTACT create blocked by caller policy', phone);
+    return null;
+  }
 
   const acquired = await tryAcquireCreateLock(ddb, table, phone, ttlSec);
   if (!acquired) {

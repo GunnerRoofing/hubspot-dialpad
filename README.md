@@ -20,9 +20,11 @@ Lambda that logs Dialpad calls and SMS messages as HubSpot engagement records, a
 ## Files
 
 ```
-index.js       — Lambda handler (calls + SMS)
-deploy.sh      — zip, upload, and set the Lambda runtime to Node.js 24
-package.json   — dependencies
+index.js          — Lambda handler (calls + SMS)
+contactIdentity.js — HubSpot contact resolution and create lock
+smsPolicy.js      — outbound sender role gate and display names
+deploy.sh         — zip, upload, and set the Lambda runtime to Node.js 24
+package.json      — dependencies and test command
 ```
 
 ## Environment Variables
@@ -30,6 +32,8 @@ package.json   — dependencies
 | Variable | Description |
 |---|---|
 | `HUBSPOT_ACCESS_TOKEN` | HubSpot production private app token |
+| `SMS_LEAD_CREATING_TEAM_IDS` | Optional comma-separated HubSpot team IDs allowed to create contacts from unknown outbound numbers; takes precedence over names |
+| `SMS_LEAD_CREATING_TEAM_NAMES` | Optional comma-separated exact HubSpot team names; defaults to `Sales,Sales Team` |
 
 ## Deploy
 
@@ -43,10 +47,13 @@ environment variables. Live handler verification is still required after deploym
 
 ## How Contact Lookup Works
 
-1. Try `dialpad_id` property on HubSpot contact (exact match)
-2. Fall back to phone number match (`phone` or `mobilephone`)
+1. Search HubSpot by normalized phone and Dialpad contact ID.
+2. Fall back to the Dialpad contact's email.
+3. Reuse and enrich the best existing contact.
+4. For an unknown inbound number, create the contact as lead intake.
+5. For an unknown outbound number, create only when the sender's HubSpot owner belongs to an allowed Sales team. PM, service, operations, unmapped, and ownerless senders are skipped. Existing contacts still receive their SMS history.
 
-If no contact is found, the engagement is still created but not associated.
+Outbound activity labels use Dialpad's target name when present, then the mapped sender email as a readable employee name, then the sending number. A mapped employee no longer appears as `Agent`.
 
 ## Callcenter Call Dedup
 
