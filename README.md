@@ -22,7 +22,7 @@ Lambda that logs Dialpad calls and SMS messages as HubSpot engagement records, a
 ```
 index.js          — Lambda handler (calls + SMS)
 contactIdentity.js — HubSpot contact resolution and create lock
-smsPolicy.js      — outbound sender role gate and display names
+smsPolicy.js      — SMS owner routing, outbound role gate, and display names
 deploy.sh         — zip, upload, and set the Lambda runtime to Node.js 24
 package.json      — dependencies and test command
 ```
@@ -50,8 +50,8 @@ environment variables. Live handler verification is still required after deploym
 1. Search HubSpot by normalized phone and Dialpad contact ID.
 2. Fall back to the Dialpad contact's email.
 3. Reuse and enrich the best existing contact.
-4. For an unknown inbound number, create the contact as lead intake.
-5. For an unknown outbound number, create only when the sender's HubSpot owner belongs to an allowed Sales team. PM, service, operations, unmapped, and ownerless senders are skipped. Existing contacts still receive their SMS history.
+4. For an unknown inbound number, create the contact as lead intake and assign it to the HubSpot owner mapped from the destination employee line. Unmapped lines remain unowned.
+5. For an unknown outbound number, create only when the sender's HubSpot owner belongs to an allowed Sales team. PM, service, operations, unmapped, and ownerless senders are skipped. Existing contacts still receive their SMS history and are never reassigned.
 
 Outbound activity labels use Dialpad's target name when present, then the mapped sender email as a readable employee name, then the sending number. A mapped employee no longer appears as `Agent`.
 

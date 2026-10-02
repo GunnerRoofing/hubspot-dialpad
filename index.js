@@ -7,7 +7,8 @@ const {
 } = require('./contactIdentity');
 const { mapBusEvent } = require('./busMap');
 const {
-  ownerCanCreateOutboundContact,
+  smsRouting,
+  contactCreationPolicy,
   displayNameFromEmail,
 } = require('./smsPolicy');
 
@@ -237,34 +238,33 @@ async function handleSmsEvent(client, body) {
 
   const messageBody = body.text || body.text_content || body.mms_url || '';
   const msgId = body.id !== undefined && body.id !== null ? String(body.id) : null;
-  const toNumber = Array.isArray(body.to_number) ? body.to_number[0] : body.to_number;
-  const externalPhone = body.direction === 'inbound' ? body.from_number : toNumber;
+  const { externalPhone, ownerEmails } = smsRouting(body, dialpadEmailForNumber);
   if (!externalPhone) {
     console.log('SMS: no customer phone resolvable — skip. dir:', body.direction);
     return;
   }
 
   let owner = null;
-  let senderEmail = null;
-  let allowCreate = true;
+  let ownerEmail = null;
+  for (const candidate of ownerEmails) {
+    owner = await ownerForEmail(client, candidate);
+    if (owner) {
+      ownerEmail = candidate;
+      break;
+    }
+  }
+
+  const { allowCreate, ownerId } = contactCreationPolicy(body.direction, owner);
   if (body.direction === 'outbound') {
-    senderEmail = body.target?.email || null;
-    owner = await ownerForEmail(client, senderEmail);
-
-    if (!owner) {
-      const mappedEmail = dialpadEmailForNumber(body.from_number);
-      if (mappedEmail) {
-        senderEmail = mappedEmail;
-        owner = await ownerForEmail(client, mappedEmail);
-      }
-    }
-
-    allowCreate = ownerCanCreateOutboundContact(owner);
     if (allowCreate) {
-      console.log('SMS: outbound unknown-contact creation allowed for sales sender', senderEmail);
+      console.log('SMS: outbound unknown-contact creation allowed for sales sender', ownerEmail);
     } else {
-      console.log('SMS: outbound unknown-contact creation blocked for non-sales sender', senderEmail || '(unmapped)');
+      console.log('SMS: outbound unknown-contact creation blocked for non-sales sender', ownerEmails[0] || '(unmapped)');
     }
+  } else if (ownerId) {
+    console.log('SMS: inbound new-contact owner resolved from destination line', ownerEmail);
+  } else {
+    console.log('SMS: inbound destination has no mapped HubSpot owner', ownerEmails[0] || '(unmapped)');
   }
 
   const contact = await resolveOrCreateContact({
@@ -274,7 +274,7 @@ async function handleSmsEvent(client, body) {
     rawPhone: externalPhone,
     dialpadContactId: body.contact?.id,
     dialpadContact: body.contact,
-    ownerId: owner?.id || null,
+    ownerId,
     allowCreate,
     ttlSec: Number(process.env.CREATE_LOCK_TTL_SEC || 600),
   });
@@ -287,7 +287,7 @@ async function handleSmsEvent(client, body) {
   // Keyed deterministically by hs_engagement_source_id so we can find today's thread.
   const tsMs = Number(body.created_date) || Date.now();
   const threadKey = `dpthread-${contact.id}-${easternDayKey(tsMs)}`;
-  const line = buildSmsLine(body, messageBody, tsMs, senderEmail);
+  const line = buildSmsLine(body, messageBody, tsMs, ownerEmail);
 
   const existing = await client.crm.objects.searchApi.doSearch('communications', {
     filterGroups: [{ filters: [{ propertyName: 'hs_engagement_source_id', operator: 'EQ', value: threadKey }] }],
