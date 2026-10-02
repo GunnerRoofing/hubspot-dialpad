@@ -1,6 +1,7 @@
 'use strict';
 
 const DEFAULT_LEAD_CREATING_TEAM_NAMES = 'Sales,Sales Team';
+const DEFAULT_LEAD_CREATING_INBOUND_NUMBERS = '+18662626005';
 
 function parseList(value) {
   return new Set(
@@ -37,6 +38,7 @@ function smsRouting(body, ownerEmailForNumber) {
 
   return {
     externalPhone: inbound ? body.from_number : toNumber,
+    internalNumber,
     ownerEmails: [...new Set(
       candidates
         .map((email) => String(email || '').trim().toLowerCase())
@@ -45,13 +47,18 @@ function smsRouting(body, ownerEmailForNumber) {
   };
 }
 
-function contactCreationPolicy(direction, owner, env = process.env) {
+function contactCreationPolicy(direction, owner, internalNumber, env = process.env) {
+  const ownerAllowed = ownerCanCreateOutboundContact(owner, env);
   if (direction === 'inbound') {
-    return { allowCreate: true, ownerId: owner?.id || null };
+    const allowedNumbers = parseList(
+      env.SMS_LEAD_CREATING_INBOUND_NUMBERS || DEFAULT_LEAD_CREATING_INBOUND_NUMBERS,
+    );
+    const destinationAllowed = allowedNumbers.has(String(internalNumber || '').toLowerCase());
+    const allowed = destinationAllowed || ownerAllowed;
+    return { allowCreate: allowed, ownerId: allowed ? owner?.id || null : null };
   }
 
-  const allowed = ownerCanCreateOutboundContact(owner, env);
-  return { allowCreate: allowed, ownerId: allowed ? owner.id : null };
+  return { allowCreate: ownerAllowed, ownerId: ownerAllowed ? owner.id : null };
 }
 
 function displayNameFromEmail(email) {

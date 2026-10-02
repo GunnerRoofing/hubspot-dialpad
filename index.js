@@ -238,7 +238,7 @@ async function handleSmsEvent(client, body) {
 
   const messageBody = body.text || body.text_content || body.mms_url || '';
   const msgId = body.id !== undefined && body.id !== null ? String(body.id) : null;
-  const { externalPhone, ownerEmails } = smsRouting(body, dialpadEmailForNumber);
+  const { externalPhone, internalNumber, ownerEmails } = smsRouting(body, dialpadEmailForNumber);
   if (!externalPhone) {
     console.log('SMS: no customer phone resolvable — skip. dir:', body.direction);
     return;
@@ -254,17 +254,21 @@ async function handleSmsEvent(client, body) {
     }
   }
 
-  const { allowCreate, ownerId } = contactCreationPolicy(body.direction, owner);
+  const { allowCreate, ownerId } = contactCreationPolicy(
+    body.direction,
+    owner,
+    internalNumber,
+  );
   if (body.direction === 'outbound') {
     if (allowCreate) {
       console.log('SMS: outbound unknown-contact creation allowed for sales sender', ownerEmail);
     } else {
       console.log('SMS: outbound unknown-contact creation blocked for non-sales sender', ownerEmails[0] || '(unmapped)');
     }
-  } else if (ownerId) {
-    console.log('SMS: inbound new-contact owner resolved from destination line', ownerEmail);
+  } else if (allowCreate) {
+    console.log('SMS: inbound unknown-contact creation allowed for destination', internalNumber, ownerEmail || '(main line)');
   } else {
-    console.log('SMS: inbound destination has no mapped HubSpot owner', ownerEmails[0] || '(unmapped)');
+    console.log('SMS: inbound unknown-contact creation blocked for destination', internalNumber || '(unmapped)');
   }
 
   const contact = await resolveOrCreateContact({

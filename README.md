@@ -34,6 +34,7 @@ package.json      — dependencies and test command
 | `HUBSPOT_ACCESS_TOKEN` | HubSpot production private app token |
 | `SMS_LEAD_CREATING_TEAM_IDS` | Optional comma-separated HubSpot team IDs allowed to create contacts from unknown outbound numbers; takes precedence over names |
 | `SMS_LEAD_CREATING_TEAM_NAMES` | Optional comma-separated exact HubSpot team names; defaults to `Sales,Sales Team` |
+| `SMS_LEAD_CREATING_INBOUND_NUMBERS` | Optional comma-separated internal destination numbers allowed to create contacts from unknown inbound senders; defaults to Gunner's main line `+18662626005` |
 
 ## Deploy
 
@@ -50,7 +51,7 @@ environment variables. Live handler verification is still required after deploym
 1. Search HubSpot by normalized phone and Dialpad contact ID.
 2. Fall back to the Dialpad contact's email.
 3. Reuse and enrich the best existing contact.
-4. For an unknown inbound number, create the contact as lead intake and assign it to the HubSpot owner mapped from the destination employee line. Unmapped lines remain unowned.
+4. For an unknown inbound number, create only when the internal destination is the configured main line or maps to a HubSpot owner on an allowed Sales team. Direct operations, PM, service, unmapped, and other shared lines are skipped. Existing contacts still receive their SMS history.
 5. For an unknown outbound number, create only when the sender's HubSpot owner belongs to an allowed Sales team. PM, service, operations, unmapped, and ownerless senders are skipped. Existing contacts still receive their SMS history and are never reassigned.
 
 Outbound activity labels use Dialpad's target name when present, then the mapped sender email as a readable employee name, then the sending number. A mapped employee no longer appears as `Agent`.

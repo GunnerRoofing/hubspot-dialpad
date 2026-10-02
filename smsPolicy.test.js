@@ -29,11 +29,25 @@ test('configured team IDs take precedence over team names', () => {
   assert.equal(ownerCanCreateOutboundContact(owner, env), false);
 });
 
-test('inbound contact creation assigns the mapped destination owner', () => {
-  const owner = { id: 'john-owner', teams: [] };
-  assert.deepEqual(contactCreationPolicy('inbound', owner, {}), {
+test('inbound creation is limited to Sales-owned and configured main lines', () => {
+  const sales = { id: 'sales-owner', teams: [{ id: '7', name: 'Sales Team' }] };
+  const operations = { id: 'operations-owner', teams: [{ id: '8', name: 'Operations' }] };
+
+  assert.deepEqual(contactCreationPolicy('inbound', sales, '+12037144877', {}), {
     allowCreate: true,
-    ownerId: 'john-owner',
+    ownerId: 'sales-owner',
+  });
+  assert.deepEqual(contactCreationPolicy('inbound', operations, '+12035877738', {}), {
+    allowCreate: false,
+    ownerId: null,
+  });
+  assert.deepEqual(contactCreationPolicy('inbound', null, '+16464807827', {}), {
+    allowCreate: false,
+    ownerId: null,
+  });
+  assert.deepEqual(contactCreationPolicy('inbound', null, '+18662626005', {}), {
+    allowCreate: true,
+    ownerId: null,
   });
 });
 
@@ -47,8 +61,15 @@ test('inbound SMS routes the customer contact to the mapped destination salesper
 
   assert.deepEqual(route, {
     externalPhone: '+16462866995',
+    internalNumber: '+12037144877',
     ownerEmails: ['john.miller@gunnerroofing.com', 'payload-target@gunnerroofing.com'],
   });
+});
+
+test('configured inbound numbers replace the default main line', () => {
+  const env = { SMS_LEAD_CREATING_INBOUND_NUMBERS: '+12035550100' };
+  assert.equal(contactCreationPolicy('inbound', null, '+12035550100', env).allowCreate, true);
+  assert.equal(contactCreationPolicy('inbound', null, '+18662626005', env).allowCreate, false);
 });
 
 test('outbound SMS keeps the recipient as the contact and sender as owner candidate', () => {
@@ -60,6 +81,7 @@ test('outbound SMS keeps the recipient as the contact and sender as owner candid
 
   assert.deepEqual(route, {
     externalPhone: '+16462866995',
+    internalNumber: '+12037144877',
     ownerEmails: ['john.miller@gunnerroofing.com'],
   });
 });
