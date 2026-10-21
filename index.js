@@ -10,6 +10,7 @@ const {
   smsRouting,
   contactCreationPolicy,
   displayNameFromEmail,
+  smsThreadOwnerId,
 } = require('./smsPolicy');
 
 const ddb = makeDdbClient();
@@ -295,7 +296,7 @@ async function handleSmsEvent(client, body) {
 
   const existing = await client.crm.objects.searchApi.doSearch('communications', {
     filterGroups: [{ filters: [{ propertyName: 'hs_engagement_source_id', operator: 'EQ', value: threadKey }] }],
-    properties: ['hs_communication_body', 'hs_engagement_source_id'],
+    properties: ['hs_communication_body', 'hs_engagement_source_id', 'hubspot_owner_id'],
     limit: 1,
   });
   const thread = existing.results?.[0];
@@ -308,15 +309,18 @@ async function handleSmsEvent(client, body) {
       console.log('SMS: message already in thread', msgId, '— skip');
       return;
     }
-    await client.crm.objects.basicApi.update('communications', thread.id, {
-      properties: { hs_communication_body: curBody + '<br>' + line, hs_timestamp: String(tsMs) },
-    });
-    console.log('SMS: appended to thread', thread.id, '| contact', contact.id, '| msg', msgId);
+    const properties = { hs_communication_body: curBody + '<br>' + line, hs_timestamp: String(tsMs) };
+    const fillOwnerId = smsThreadOwnerId(thread.properties.hubspot_owner_id, owner?.id);
+    if (fillOwnerId) properties.hubspot_owner_id = fillOwnerId;
+    await client.crm.objects.basicApi.update('communications', thread.id, { properties });
+    console.log('SMS: appended to thread', thread.id, '| contact', contact.id, '| msg', msgId,
+                '| owner', fillOwnerId ? `${fillOwnerId} (filled)` : thread.properties.hubspot_owner_id || 'none');
     return;
   }
 
   // First message of the day for this contact → create the thread + associate once.
   // (Rare race: two messages within HubSpot's search-index lag can split into two threads.)
+  const threadOwnerId = smsThreadOwnerId(null, owner?.id);
   const comm = await client.crm.objects.basicApi.create('communications', {
     properties: {
       hs_communication_channel_type: 'SMS',
@@ -324,9 +328,11 @@ async function handleSmsEvent(client, body) {
       hs_communication_body: line,
       hs_timestamp: String(tsMs),
       hs_engagement_source_id: threadKey,
+      ...(threadOwnerId && { hubspot_owner_id: threadOwnerId }),
     },
   });
-  console.log('SMS: created thread', comm.id, '| contact', contact.id, '| key', threadKey);
+  console.log('SMS: created thread', comm.id, '| contact', contact.id, '| key', threadKey,
+              '| owner', threadOwnerId || 'none');
 
   await client.crm.associations.v4.basicApi.create(
     'communications', comm.id, 'contacts', contact.id,

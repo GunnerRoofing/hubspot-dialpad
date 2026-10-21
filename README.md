@@ -9,7 +9,7 @@ Lambda that logs Dialpad calls and SMS messages as HubSpot engagement records, a
 
 **Calls:** When a Dialpad call ends (`hangup`), creates a HubSpot call record with direction, duration, and recording link. Associates to the contact and their most recent deal.
 
-**SMS:** When a Dialpad SMS is sent or received, creates a HubSpot communication record with the message body. Associates to the contact and their most recent deal.
+**SMS:** When a Dialpad SMS is sent or received, appends it to one daily communication thread per contact (Eastern day). Associates the thread to the contact and their most recent deal. The thread's HubSpot owner is the employee on the Dialpad line (sender for outbound, destination for inbound), so users with owner- or team-scoped permissions can see it. The first resolved employee owns the thread; an unowned thread gets an owner on its next mapped message; an existing owner is never changed. Main-line and unmapped-line threads stay unassigned.
 
 ## Stack
 

@@ -61,6 +61,15 @@ function contactCreationPolicy(direction, owner, internalNumber, env = process.e
   return { allowCreate: ownerAllowed, ownerId: ownerAllowed ? owner.id : null };
 }
 
+// Owner to stamp on a daily SMS thread, or null when nothing should change. Unassigned threads
+// can be invisible to users whose HubSpot permissions are scoped to their own or their team's
+// records, so the employee party (sender for outbound, destination line for inbound) owns the
+// thread. The first resolved employee keeps it; later employees never reassign it.
+function smsThreadOwnerId(currentOwnerId, employeeOwnerId) {
+  if (currentOwnerId || !employeeOwnerId) return null;
+  return String(employeeOwnerId);
+}
+
 function displayNameFromEmail(email) {
   const local = String(email || '').trim().split('@')[0];
   if (!local) return null;
@@ -73,5 +82,6 @@ module.exports = {
   ownerCanCreateOutboundContact,
   smsRouting,
   contactCreationPolicy,
+  smsThreadOwnerId,
   displayNameFromEmail,
 };
