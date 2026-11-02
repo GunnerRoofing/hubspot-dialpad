@@ -27,6 +27,10 @@ function mapSms(d) {
     from_number: inbound ? external : internal,
     to_number: inbound ? internal : external,
     created_date: Number.isFinite(sent) ? sent : Date.now(),
+    target: {
+      name: d.target_name || null,
+      email: d.target_email || null,
+    },
   };
 }
 
@@ -35,7 +39,7 @@ function mapCall(d) {
   const started = d.received_at ? Date.parse(d.received_at) : Date.now();
   return {
     call_id: d.dialpad_call_id,
-    state: 'hangup',
+    state: d.state || 'hangup',
     direction: d.direction,
     external_number: d.external_number || null,
     internal_number: d.internal_number || null,

@@ -11,12 +11,14 @@ test('sms insert maps customer phone by direction', () => {
       v: 1, inserted: true, direction: 'inbound',
       external_number: '+15551111', internal_number: '+15552222',
       body: 'hi', dialpad_msg_id: '9', sent_at: '2026-09-23T12:00:00Z',
+      target_name: 'John Miller', target_email: 'john.miller@gunnerroofing.com',
     },
   });
   assert.equal(body.from_number, '+15551111');
   assert.equal(body.to_number, '+15552222');
   assert.equal(body.text, 'hi');
   assert.equal(body.id, '9');
+  assert.deepEqual(body.target, { name: 'John Miller', email: 'john.miller@gunnerroofing.com' });
 });
 
 test('skip when not inserted or wrong source', () => {
@@ -43,6 +45,12 @@ test('call final maps hangup body and skips open calls', () => {
   assert.equal(body.state, 'hangup');
   assert.equal(body.target.email, 'a@gunnerroofing.com');
   assert.equal(body.entry_point_call_id, 'ep1');
+  const missed = mapBusEvent({
+    source: 'gunner.comms-admin',
+    'detail-type': 'dialpad.call',
+    detail: { v: 1, inserted: true, final: true, state: 'missed', dialpad_call_id: 'c3' },
+  });
+  assert.equal(missed.state, 'missed');
   assert.equal(mapBusEvent({
     source: 'gunner.comms-admin',
     'detail-type': 'dialpad.call',

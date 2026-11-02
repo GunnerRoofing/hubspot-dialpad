@@ -61,13 +61,13 @@ function contactCreationPolicy(direction, owner, internalNumber, env = process.e
   return { allowCreate: ownerAllowed, ownerId: ownerAllowed ? owner.id : null };
 }
 
-// Owner to stamp on a daily SMS thread, or null when nothing should change. Unassigned threads
-// can be invisible to users whose HubSpot permissions are scoped to their own or their team's
-// records, so the employee party (sender for outbound, destination line for inbound) owns the
-// thread. The first resolved employee keeps it; later employees never reassign it.
-function smsThreadOwnerId(currentOwnerId, employeeOwnerId) {
-  if (currentOwnerId || !employeeOwnerId) return null;
-  return String(employeeOwnerId);
+// hs_engagement_source_id of the daily SMS thread that holds this message. Each employee gets their
+// own thread per contact per Eastern day, owned by them, so every employee's texts count toward
+// their activity and stay visible under owner/team-scoped permissions. Messages with no employee
+// owner (main line, unmapped line) share the unowned thread.
+function smsThreadKey(contactId, dayKey, ownerId) {
+  const base = `dpthread-${contactId}-${dayKey}`;
+  return ownerId ? `${base}-o${ownerId}` : base;
 }
 
 function displayNameFromEmail(email) {
@@ -82,6 +82,6 @@ module.exports = {
   ownerCanCreateOutboundContact,
   smsRouting,
   contactCreationPolicy,
-  smsThreadOwnerId,
+  smsThreadKey,
   displayNameFromEmail,
 };

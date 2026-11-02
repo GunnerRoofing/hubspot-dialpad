@@ -6,7 +6,7 @@ const {
   ownerCanCreateOutboundContact,
   smsRouting,
   contactCreationPolicy,
-  smsThreadOwnerId,
+  smsThreadKey,
   displayNameFromEmail,
 } = require('./smsPolicy');
 
@@ -87,11 +87,13 @@ test('outbound SMS keeps the recipient as the contact and sender as owner candid
   });
 });
 
-test('SMS thread takes the first employee owner and is never reassigned', () => {
-  assert.equal(smsThreadOwnerId(null, 80661847), '80661847');
-  assert.equal(smsThreadOwnerId('', 'sales-owner'), 'sales-owner');
-  assert.equal(smsThreadOwnerId('80661847', 'pm-owner'), null);
-  assert.equal(smsThreadOwnerId(null, null), null);
+test('each employee gets their own daily thread with a contact; unowned messages share one', () => {
+  const rep = smsThreadKey('501', '20261102', '80661847');
+  const pm = smsThreadKey('501', '20261102', '77006918');
+  assert.notEqual(rep, pm);
+  assert.equal(smsThreadKey('501', '20261102', '80661847'), rep);
+  assert.notEqual(smsThreadKey('501', '20261103', '80661847'), rep);
+  assert.equal(smsThreadKey('501', '20261102', null), 'dpthread-501-20261102');
 });
 
 test('mapped sender email becomes a readable activity name', () => {

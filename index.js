@@ -10,8 +10,14 @@ const {
   smsRouting,
   contactCreationPolicy,
   displayNameFromEmail,
-  smsThreadOwnerId,
+  smsThreadKey,
 } = require('./smsPolicy');
+const {
+  CALL_FINAL_STATES,
+  callOwnerEmail,
+  isUnansweredOperatorLeg,
+  callClaimOwnerId,
+} = require('./callPolicy');
 
 const ddb = makeDdbClient();
 
@@ -49,7 +55,7 @@ exports.handler = async (event) => {
 
   try {
     if (isCall) {
-      if (body.state !== 'hangup' && body.event !== 'hangup') {
+      if (!CALL_FINAL_STATES.has(body.state) && body.event !== 'hangup') {
         return respond(200, { status: 'skipped', reason: 'call not completed' });
       }
       await handleCallEvent(client, body);
@@ -288,15 +294,16 @@ async function handleSmsEvent(client, body) {
     return;
   }
 
-  // Daily-thread rollup (mimics native): one SMS comm per contact per Eastern day, appended.
-  // Keyed deterministically by hs_engagement_source_id so we can find today's thread.
+  // Daily-thread rollup (mimics native): one SMS comm per contact per employee per Eastern day,
+  // appended. Keyed deterministically by hs_engagement_source_id so we can find today's thread.
   const tsMs = Number(body.created_date) || Date.now();
-  const threadKey = `dpthread-${contact.id}-${easternDayKey(tsMs)}`;
+  const threadOwnerId = owner?.id ? String(owner.id) : null;
+  const threadKey = smsThreadKey(contact.id, easternDayKey(tsMs), threadOwnerId);
   const line = buildSmsLine(body, messageBody, tsMs, ownerEmail);
 
   const existing = await client.crm.objects.searchApi.doSearch('communications', {
     filterGroups: [{ filters: [{ propertyName: 'hs_engagement_source_id', operator: 'EQ', value: threadKey }] }],
-    properties: ['hs_communication_body', 'hs_engagement_source_id', 'hubspot_owner_id'],
+    properties: ['hs_communication_body', 'hs_engagement_source_id'],
     limit: 1,
   });
   const thread = existing.results?.[0];
@@ -309,18 +316,16 @@ async function handleSmsEvent(client, body) {
       console.log('SMS: message already in thread', msgId, '— skip');
       return;
     }
-    const properties = { hs_communication_body: curBody + '<br>' + line, hs_timestamp: String(tsMs) };
-    const fillOwnerId = smsThreadOwnerId(thread.properties.hubspot_owner_id, owner?.id);
-    if (fillOwnerId) properties.hubspot_owner_id = fillOwnerId;
-    await client.crm.objects.basicApi.update('communications', thread.id, { properties });
+    await client.crm.objects.basicApi.update('communications', thread.id, {
+      properties: { hs_communication_body: curBody + '<br>' + line, hs_timestamp: String(tsMs) },
+    });
     console.log('SMS: appended to thread', thread.id, '| contact', contact.id, '| msg', msgId,
-                '| owner', fillOwnerId ? `${fillOwnerId} (filled)` : thread.properties.hubspot_owner_id || 'none');
+                '| owner', threadOwnerId || 'none');
     return;
   }
 
-  // First message of the day for this contact → create the thread + associate once.
-  // (Rare race: two messages within HubSpot's search-index lag can split into two threads.)
-  const threadOwnerId = smsThreadOwnerId(null, owner?.id);
+  // First message of the day from this employee to this contact → create the thread + associate
+  // once. (Rare race: two messages within HubSpot's search-index lag can split into two threads.)
   const comm = await client.crm.objects.basicApi.create('communications', {
     properties: {
       hs_communication_channel_type: 'SMS',
@@ -366,6 +371,16 @@ async function handleCallEvent(client, body) {
     console.log('SKIP entry point call — target type:', targetType);
     return;
   }
+  if (isUnansweredOperatorLeg(body)) {
+    console.log('SKIP unanswered operator leg', body.call_id, '| entry point', body.entry_point_call_id);
+    return;
+  }
+
+  const ownerEmail = callOwnerEmail(body);
+  const owner = await ownerForEmail(client, ownerEmail);
+  const ownerId = owner?.id ? String(owner.id) : null;
+  console.log('CALL OWNER | state:', body.state, '| target:', targetType || 'none',
+              '| email:', ownerEmail || 'none', '| owner:', ownerId || 'none');
 
   // Use entry_point_call_id for callcenter operator legs (shared across all simultaneous ring legs).
   // Fall back to call_id for direct calls (no entry_point_call_id present).
@@ -373,11 +388,20 @@ async function handleCallEvent(client, body) {
   const dialpadCallId = String(body.entry_point_call_id || body.call_id || body.id);
   const existing = await client.crm.objects.searchApi.doSearch('calls', {
     filterGroups: [{ filters: [{ propertyName: 'hs_call_external_id', operator: 'EQ', value: dialpadCallId }] }],
-    properties: ['hs_call_external_id'],
+    properties: ['hs_call_external_id', 'hubspot_owner_id'],
     limit: 1,
   });
-  if (existing.results?.length) {
-    console.log('SKIP duplicate call', dialpadCallId);
+  const logged = existing.results?.[0];
+  if (logged) {
+    const claimOwnerId = callClaimOwnerId(logged.properties.hubspot_owner_id, ownerId);
+    if (!claimOwnerId) {
+      console.log('SKIP duplicate call', dialpadCallId);
+      return;
+    }
+    await client.crm.objects.basicApi.update('calls', logged.id, {
+      properties: { hubspot_owner_id: claimOwnerId },
+    });
+    console.log('CALL CLAIMED:', logged.id, '| key', dialpadCallId, '| owner', claimOwnerId);
     return;
   }
 
@@ -406,10 +430,11 @@ async function handleCallEvent(client, body) {
       hs_call_to_number: body.external_number || '',
       hs_timestamp: body.date_started ? String(body.date_started) : String(Date.now()),
       hs_call_external_id: dialpadCallId,
+      ...(ownerId && { hubspot_owner_id: ownerId }),
     },
   });
 
-  console.log('CALL CREATED:', call.id);
+  console.log('CALL CREATED:', call.id, '| owner', ownerId || 'none');
 
   if (!call.id || !contact) {
     console.log('STOPPING — callId:', call.id, 'contact:', contact?.id || 'null');
