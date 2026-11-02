@@ -34,9 +34,10 @@ Lambda
 
 ## Key Behavior
 
-- **Calls:** Only processes `hangup` state — one log per completed call.
-- **SMS:** Processes all SMS events. Dedup via `hs_engagement_source_id = body.id`.
-- **Call dedup:** `hs_call_external_id = body.call_id || body.id`. One record per unique call_id.
+- **Calls:** Processes final states (`hangup`, `missed`, `voicemail_uploaded`) — one log per call. Owner = the Dialpad user on a `target.type = user` leg (`callPolicy.js`).
+- **SMS:** One daily thread per contact per employee, owned by that employee (`smsThreadKey`). Main-line/unmapped messages share an unassigned thread. Dedup within a thread by the rendered line.
+- **Ownership:** every record is owned by the employee on the Dialpad line, so reps see and get credited for their own activity. Employees without a HubSpot user cannot own records.
+- **Call dedup:** `hs_call_external_id = entry_point_call_id || call_id`. One record per call.
 - **Contact lookup:** First tries `dialpad_id` property on HubSpot contact, falls back to phone number match.
 - **Deal association:** Fetches all deals for the contact, picks the most recently created one.
 - **Talk time:** Uses `body.talk_time` (milliseconds), NOT `body.duration`. Duration was unreliable.
@@ -44,13 +45,11 @@ Lambda
 
 ## Callcenter Call Handling
 
-Callcenter calls create two types of `hangup` events:
-1. **Entry point leg** — `target.type` is `coaching_team` or `callcenter`. No agent info. **Skipped entirely.**
-2. **Operator leg** — `target.type` is `user`. Has agent email. **Logged.** Dedup key is `entry_point_call_id` (shared across all simultaneous ring legs of the same call).
+All legs of a routed call share `entry_point_call_id`, used as the dedup key.
+1. **Entry point leg** — `target.type` is `call_center` (Dialpad's current name; the old `callcenter`/`coaching_team` skip no longer matches). No agent info. Logged unassigned if it arrives first.
+2. **Operator leg** — `target.type` is `user`, has agent email. `missed` legs are skipped; the answering leg creates the call or claims an unassigned one. An owned call is never reassigned.
 
 **Note:** `master_call_id` is always `null` in Dialpad payloads — do not use it.
-
-**TODO (pending VP decision):** Unanswered callcenter calls (entry point fires `hangup`, no operator leg exists) are currently not logged. Decide whether to log these as 0-duration calls against the contact.
 
 ## Infrastructure
 
@@ -100,4 +99,4 @@ For any change beyond a single trivial edit:
 - **`talk_time` not `duration`:** Dialpad's `duration` field was unreliable. `talk_time` is in milliseconds.
 - **Simultaneous ring dedup:** Use `entry_point_call_id` — shared across all operator legs of the same callcenter call. `master_call_id` is always null, do not use it.
 - **Dialpad payload is plain JSON:** Unlike the dialpad-hubspot-sync Lambda, this one receives raw JSON, not a base64-encoded JWT.
-- **`Unknown User` in HubSpot:** Happens when the agent's identity isn't resolved — the call is logged but attributed to no user. Not a bug in this Lambda, it's a HubSpot limitation when no agent association is set.
+- **`Unknown User` in HubSpot:** a record whose owner could not be resolved (office/department/callcenter leg, or an employee with no HubSpot user).

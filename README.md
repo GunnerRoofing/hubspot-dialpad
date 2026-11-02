@@ -7,9 +7,11 @@ Lambda that logs Dialpad calls and SMS messages as HubSpot engagement records, a
 
 ## What It Does
 
-**Calls:** When a Dialpad call ends (`hangup`), creates a HubSpot call record with direction, duration, and recording link. Associates to the contact and their most recent deal.
+**Calls:** When a Dialpad call ends (`hangup`, `missed`, or `voicemail_uploaded`), creates a HubSpot call record with direction, duration, and recording link, owned by the Dialpad user on the call (`target.type = user`). Associates to the contact and their most recent deal. Office, department, callcenter, and dynamic-caller legs name no employee and stay unassigned.
 
-**SMS:** When a Dialpad SMS is sent or received, appends it to one daily communication thread per contact (Eastern day). Associates the thread to the contact and their most recent deal. The thread's HubSpot owner is the employee on the Dialpad line (sender for outbound, destination for inbound), so users with owner- or team-scoped permissions can see it. The first resolved employee owns the thread; an unowned thread gets an owner on its next mapped message; an existing owner is never changed. Main-line and unmapped-line threads stay unassigned.
+**SMS:** When a Dialpad SMS is sent or received, appends it to a daily communication thread per contact **per employee** (Eastern day), owned by that employee: the sender for outbound, the destination line's employee for inbound. Each employee's texts count toward their own activity and stay visible under owner- or team-scoped permissions. Main-line and unmapped-line messages share one unassigned thread per contact per day.
+
+An employee resolves to a HubSpot owner by email (Dialpad target email from the `gunner-dialpad` bus, then the line map). Employees without a HubSpot user (PMs today) cannot own records, so their activity stays unassigned.
 
 ## Stack
 
@@ -22,7 +24,8 @@ Lambda that logs Dialpad calls and SMS messages as HubSpot engagement records, a
 ```
 index.js          — Lambda handler (calls + SMS)
 contactIdentity.js — HubSpot contact resolution and create lock
-smsPolicy.js      — SMS owner routing, outbound role gate, and display names
+smsPolicy.js      — SMS owner routing, thread key, outbound role gate, and display names
+callPolicy.js     — call owner, unanswered-operator-leg skip, and claim rule
 deploy.sh         — zip, upload, and set the Lambda runtime to Node.js 24
 package.json      — dependencies and test command
 ```
@@ -58,6 +61,6 @@ Outbound activity labels use Dialpad's target name when present, then the mapped
 
 ## Callcenter Call Dedup
 
-Entry point legs (`target.type = coaching_team/callcenter`) are skipped — they have no agent info and were creating "Unknown User" records. Operator legs (`target.type = user`) are logged using `entry_point_call_id` as the dedup key, which is shared across all simultaneous ring legs of the same call.
+All legs of a routed call share `entry_point_call_id` as the dedup key. Operator legs that end `missed` are skipped so they cannot claim the call. If the entry-point leg (`target.type = call_center`, no agent) logs the call first, it is unassigned until the answering operator's leg arrives and claims it. An owned call is never reassigned.
 
-**Pending (VP decision):** Unanswered callcenter calls are currently not logged.
+Unanswered callcenter calls are logged unassigned from the entry-point leg. (Dialpad now reports that leg as `call_center`; the old `callcenter` skip no longer matches it.)
