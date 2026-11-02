@@ -18,15 +18,10 @@ const {
   isUnansweredOperatorLeg,
   callClaimOwnerId,
 } = require('./callPolicy');
-const { runOwnerBackfill } = require('./backfill');
 
 const ddb = makeDdbClient();
 
 exports.handler = async (event) => {
-  if (event && event.source === 'gunner.owner-backfill') {
-    const client = new hubspot.Client({ accessToken: process.env.HUBSPOT_ACCESS_TOKEN, numberOfApiCallRetries: 6 });
-    return runOwnerBackfill(client, ownerForEmail, event);
-  }
   let body = {};
   if (event && event.source === 'gunner.comms-admin') {
     body = mapBusEvent(event);

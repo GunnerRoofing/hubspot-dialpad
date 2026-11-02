@@ -6,7 +6,7 @@ REGION="us-east-2"
 
 echo "Zipping..."
 rm -f function.zip
-zip -r function.zip index.js contactIdentity.js smsPolicy.js callPolicy.js busMap.js backfill.js node_modules/ package.json
+zip -r function.zip index.js contactIdentity.js smsPolicy.js callPolicy.js busMap.js node_modules/ package.json
 
 echo "Deploying to Lambda..."
 aws lambda update-function-code \
